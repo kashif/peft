@@ -21,8 +21,11 @@ from peft import (
     BeftConfig,
     BOFTConfig,
     C3AConfig,
+    DeftConfig,
     DeloraConfig,
     FourierFTConfig,
+    FrodConfig,
+    GloraConfig,
     GraloraConfig,
     HiraConfig,
     HRAConfig,
@@ -37,6 +40,7 @@ from peft import (
     PromptLearningConfig,
     PromptTuningConfig,
     PsoftConfig,
+    RandLoraConfig,
     RoadConfig,
     ShiraConfig,
     TinyLoraConfig,
@@ -90,6 +94,13 @@ ALL_CONFIGS = [
         },
     ),
     (
+        DeftConfig,
+        {
+            "task_type": "FEATURE_EXTRACTION",
+            "target_modules": None,
+        },
+    ),
+    (
         DeloraConfig,
         {
             "task_type": "FEATURE_EXTRACTION",
@@ -102,6 +113,21 @@ ALL_CONFIGS = [
         {
             "task_type": "FEATURE_EXTRACTION",
             "n_frequency": 10,
+            "target_modules": None,
+        },
+    ),
+    (
+        FrodConfig,
+        {
+            "task_type": "FEATURE_EXTRACTION",
+            "target_modules": None,
+            "sparse_rate": 0.01,
+        },
+    ),
+    (
+        GloraConfig,
+        {
+            "task_type": "FEATURE_EXTRACTION",
             "target_modules": None,
         },
     ),
@@ -206,6 +232,15 @@ ALL_CONFIGS = [
             "depth": 1,
             "act_fn": "relu",
             "scaling": 1.0,
+        },
+    ),
+    (
+        RandLoraConfig,
+        {
+            "task_type": "FEATURE_EXTRACTION",
+            "target_modules": None,
+            "r": 8,
+            "randlora_alpha": 1,
         },
     ),
     (

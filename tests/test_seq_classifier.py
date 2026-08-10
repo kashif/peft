@@ -21,8 +21,11 @@ from peft import (
     BeftConfig,
     BOFTConfig,
     C3AConfig,
+    DeftConfig,
     DeloraConfig,
     FourierFTConfig,
+    FrodConfig,
+    GloraConfig,
     GraloraConfig,
     HiraConfig,
     HRAConfig,
@@ -37,6 +40,7 @@ from peft import (
     PromptTuningConfig,
     PromptTuningInit,
     PsoftConfig,
+    RandLoraConfig,
     RoadConfig,
     ShiraConfig,
     TinyLoraConfig,
@@ -91,6 +95,13 @@ ALL_CONFIGS = [
         },
     ),
     (
+        DeftConfig,
+        {
+            "task_type": "SEQ_CLS",
+            "target_modules": None,
+        },
+    ),
+    (
         DeloraConfig,
         {
             "task_type": "SEQ_CLS",
@@ -103,6 +114,21 @@ ALL_CONFIGS = [
         {
             "task_type": "SEQ_CLS",
             "n_frequency": 10,
+            "target_modules": None,
+        },
+    ),
+    (
+        FrodConfig,
+        {
+            "task_type": "SEQ_CLS",
+            "target_modules": None,
+            "sparse_rate": 0.01,
+        },
+    ),
+    (
+        GloraConfig,
+        {
+            "task_type": "SEQ_CLS",
             "target_modules": None,
         },
     ),
@@ -215,6 +241,15 @@ ALL_CONFIGS = [
             "act_fn": "relu",
             "task_type": "SEQ_CLS",
             "target_modules": None,
+        },
+    ),
+    (
+        RandLoraConfig,
+        {
+            "task_type": "SEQ_CLS",
+            "target_modules": None,
+            "r": 8,
+            "randlora_alpha": 1,
         },
     ),
     (
