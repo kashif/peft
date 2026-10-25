@@ -15,7 +15,6 @@ from typing import Any, NamedTuple, Protocol, TypeAlias, Union, cast, overload
 
 import numpy as np
 import torch
-from typing_extensions import Unpack
 
 from .wavelet import Wavelet as minimal_wavelet
 
@@ -26,9 +25,9 @@ class WaveletDetailTuple2d(NamedTuple):
     diagonal: torch.Tensor
 
 
-WaveletCoeff2d: TypeAlias = tuple[torch.Tensor, Unpack[tuple[WaveletDetailTuple2d, ...]]]
+WaveletCoeff2d: TypeAlias = tuple[torch.Tensor, *tuple[WaveletDetailTuple2d, ...]]
 WaveletDetailDict: TypeAlias = dict[str, torch.Tensor]
-WaveletCoeffNd: TypeAlias = tuple[torch.Tensor, Unpack[tuple[WaveletDetailDict, ...]]]
+WaveletCoeffNd: TypeAlias = tuple[torch.Tensor, *tuple[WaveletDetailDict, ...]]
 
 
 class Wavelet(Protocol):
@@ -82,13 +81,13 @@ def _outer(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 def _check_if_tensor(array: Any) -> torch.Tensor:
     if not isinstance(array, torch.Tensor):
-        raise ValueError("First element of coeffs must be the approximation coefficient tensor.")
+        raise TypeError("First element of coeffs must be the approximation coefficient tensor.")
     return array
 
 
 def _check_axes_argument(axes: Sequence[int]) -> None:
     if len(set(axes)) != len(axes):
-        raise ValueError("Cant transform the same axis twice.")
+        raise ValueError("Can't transform the same axis twice.")
 
 
 def _check_same_device(tensor: torch.Tensor, torch_device: torch.device) -> torch.Tensor:
@@ -123,7 +122,7 @@ def _coeff_tree_map(coeffs, function):
         elif isinstance(element, torch.Tensor):
             result_lst.append(function(element))
         else:
-            raise ValueError(f"Unexpected input type {type(element)}")
+            raise TypeError(f"Unexpected input type {type(element)}")
     if not result_lst:
         return [approx] if isinstance(coeffs, list) else (approx,)
     elif isinstance(result_lst[0], torch.Tensor):

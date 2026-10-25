@@ -1,4 +1,6 @@
 import ast
+from fnmatch import fnmatch
+from functools import partial
 
 import pandas as pd
 
@@ -10,7 +12,7 @@ def _evaluate_node(df, node):
     # Base Case: A simple comparison like 'price > 100'
     if isinstance(node, ast.Compare):
         if not isinstance(node.left, ast.Name):
-            raise ValueError("Left side of comparison must be a column name.")
+            raise TypeError("Left side of comparison must be a column name.")
         col = node.left.id
         if col not in df.columns:
             raise ValueError(f"Column '{col}' not found in DataFrame.")
@@ -25,12 +27,18 @@ def _evaluate_node(df, node):
         except ValueError:
             raise ValueError("Right side of comparison must be a literal (number, string, list).")
 
+        def pattern_match(df, c, v):
+            """string values are compared using fnmatch pattern matching."""
+            if isinstance(df.dtypes[c], pd.StringDtype):
+                return df[c].apply(partial(fnmatch, pat=v))
+            return df[c] == v
+
         operator_map = {
             ast.Gt:    lambda c, v: df[c] > v,
             ast.GtE:   lambda c, v: df[c] >= v,
             ast.Lt:    lambda c, v: df[c] < v,
             ast.LtE:   lambda c, v: df[c] <= v,
-            ast.Eq:    lambda c, v: df[c] == v,
+            ast.Eq:    lambda c, v: pattern_match(df, c, v),
             ast.NotEq: lambda c, v: df[c] != v,
             ast.In:    lambda c, v: df[c].isin(v),
             ast.NotIn: lambda c, v: ~df[c].isin(v)
@@ -62,12 +70,12 @@ def _evaluate_node(df, node):
 
     elif isinstance(node, ast.UnaryOp):
         if not isinstance(node.op, ast.Not):
-            raise ValueError("Only supported unary op is negation.")
+            raise TypeError("Only supported unary op is negation.")
         return ~_evaluate_node(df, node.operand)
 
     # If the node is not a comparison or boolean op, it's an unsupported expression type
     else:
-        raise ValueError(f"Unsupported expression type: {type(node).__name__}")
+        raise TypeError(f"Unsupported expression type: {type(node).__name__}")
 
 
 def parse_and_filter(df, filter_str):

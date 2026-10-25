@@ -24,7 +24,7 @@ from peft.utils import PeftType
 @dataclass
 class MissConfig(PeftConfig):
     """
-    This is the configuration class to store the configuration of a [`MiSSModel`].
+    This is the configuration class to store the configuration of a [`MissModel`].
 
     Args:
         r (`int`):
@@ -60,6 +60,8 @@ class MissConfig(PeftConfig):
             layer at this index.
         layers_pattern (`str`):
             The layer pattern name, used only if `layers_to_transform` is different from `None`.
+        bias (`str`):
+            Bias type for MiSS. Can be `'none'`, `'all'` or `'MiSS_only'`.
         modules_to_save (`List[str]`):
             List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
     """
@@ -95,8 +97,8 @@ class MissConfig(PeftConfig):
         metadata={
             "help": (
                 "True -> MiSS balance; `bat` -> Bat; `mini` -> smaller rank and efficiency"
-                "Whether to initialize the weights of the MiSS layers with their default initialization. Don't change "
-                "this setting, except if you know exactly what you're doing."
+                "Whether to initialize the weights of the MiSS layers with their default initialization. Setting this "
+                "value to False is mainly used for debugging purposes."
             ),
         },
     )

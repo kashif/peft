@@ -6,7 +6,7 @@ This goal is to provide a benchmarking framework for the different PEFT methods 
 
 ## Dataset
 
-This task trains on the [MetaMathQA]((https://huggingface.co/datasets/meta-math/MetaMathQA)) dataset and validates/tests on the [GSM8K](https://huggingface.co/datasets/openai/gsm8k) dataset ("main").
+This task trains on the [MetaMathQA](https://huggingface.co/datasets/meta-math/MetaMathQA) dataset and validates/tests on the [GSM8K](https://huggingface.co/datasets/openai/gsm8k) dataset ("main").
 
 For the model to attain good accuracy, it needs to learn to adhere to the output format and it must express basic chain of thought reasoning capabilities to get to the correct result in the first place. The task is challenging for models in the sub 7B parameter range.
 
@@ -47,9 +47,7 @@ without modifying it. For example:
 
 to run the VBLoRA default experiment again.
 
-If you set `UPLOAD_BUCKET="your_user/bucket_name"` as an environment variable prior to starting experiments
-via `make`, all experiments will be called with the `--bucket_name $UPLOAD_BUCKET` parameter and therefore
-store the checkpoints in that bucket.
+If you set `UPLOAD_BUCKET="your_user/bucket_name"` as an environment variable prior to starting experiments via `make`, all experiments will be called with the `--bucket_name $UPLOAD_BUCKET` parameter and therefore store the checkpoints in that bucket. _For maintainers_: The default bucket name should be `"peft-internal-testing/metamathqa-checkpoints"`.
 
 ### `adapter_config.json`
 

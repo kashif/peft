@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import warnings
 from dataclasses import dataclass, field
@@ -23,6 +24,24 @@ from torch import nn
 
 from peft.config import PeftConfig
 from peft.utils import PeftType
+
+
+def _get_lora_subconfig(value, config_cls):
+    """Convert a nested sub-config that was loaded as a plain dict back into its dataclass type.
+
+    `save_pretrained` serializes nested sub-configs recursively (via `asdict`), so after loading from
+    `adapter_config.json` they arrive as plain dicts. Fields declared with `init=False` are serialized but not accepted
+    by `__init__`, so they are filtered out here. The value for a sub-config should always be `None` or an instance of
+    the class (or a dict when loading), otherwise a `TypeError` is raised.
+    """
+    if value is None:
+        return None
+    if isinstance(value, config_cls):
+        return value
+    if isinstance(value, dict):
+        init_keys = {f.name for f in dataclasses.fields(config_cls) if f.init}
+        return config_cls(**{k: v for k, v in value.items() if k in init_keys})
+    raise TypeError(f"`{config_cls.__name__}` must be a `{config_cls.__name__}`, a dict, or None.")
 
 
 @dataclass
@@ -108,13 +127,8 @@ class LoftQConfig:
     This is the sub-configuration class to store the configuration of a [`LoraModel`].
 
     Args:
-        bits_pattern (`dict`): The mapping from layer names or regexp expression to bits which are different from the
-            default bits specified by `bits`. For example, `{model.decoder.layers.0.encoder_attn.k_proj: 2`}.
-        bits (`int`): Quantization bits for LoftQ.
-        iter (`int`): Alternating iterations for LoftQ.
-        fake (`bool`): True: use fp16/fp32; used for first time to save weights. False: use bitsandbytes 4bit linear
-            models. weights can't be saved. Recommend to set to True, save the weights and load the saved weights in 4
-            bits.
+        loftq_bits (`int`): Quantization bits for LoftQ.
+        loftq_iter (`int`): Alternating iterations for LoftQ.
     """
 
     loftq_bits: int = field(default=4, metadata={"help": "Quantization bits for LoftQ"})
@@ -197,6 +211,10 @@ class BdLoraConfig:
             Modules where the LoRA-B is block-diagonal. Matches each pattern in the list against the module name via
             `pattern is in target_name`. Example: ['out_proj', 'down_proj']
         nblocks: Number of blocks in block-diagonal matrices
+        match_strict:
+            If set to true, requires each target_module to have either a block-diagonal LoRA-A or LoRA-B, and raises an
+            error otherwise. You can set this to False to mix LoRA and BD-LoRA training, e.g. if some layers in your
+            module do not benefit from BD-LoRA.
     """
 
     target_modules_bd_a: Optional[list[str]] = field(
@@ -216,14 +234,12 @@ class BdLoraConfig:
             "Example: ['out_proj', 'down_proj']"
         },
     )
-    nblocks: int = (
-        field(
-            default=1,
-            metadata={
-                "help": "Number of blocks each block-diagonal matrix has. If using BD-LoRA to speed up inference, "
-                "set it to be equal to the desired sharding degree during serving."
-            },
-        ),
+    nblocks: int = field(
+        default=1,
+        metadata={
+            "help": "Number of blocks each block-diagonal matrix has. If using BD-LoRA to speed up inference, "
+            "set it to be equal to the desired sharding degree during serving."
+        },
     )
     match_strict: bool = field(
         default=True,
@@ -292,6 +308,69 @@ class EvaConfig:
             raise ValueError("`rho` must be >= 1.0")
         if self.tau < 0.0 or self.tau > 1.0:
             raise ValueError("`tau` must be between 0.0 and 1.0.")
+
+
+@dataclass
+class KasaConfig:
+    """
+    This is the sub-configuration class to store the configuration for KaSA (Knowledge-aware Singular-value Adaptation,
+    [arXiv:2412.06071](https://huggingface.co/papers/2412.06071)).
+
+    KaSA is a LoRA variant that (1) refines the frozen base weight by discarding its `r` smallest ("noisy"/long-tail)
+    singular components via a one-time SVD truncation, and (2) parametrizes the trainable update in SVD form, inserting
+    a learnable diagonal of singular values `lora_diag` (`ΔΣ`) between the LoRA `A` and `B` factors, i.e. `ΔW = scaling
+    * B @ diag(ΔΣ) @ A`.
+
+    Important notes on behavior:
+
+    - The base-weight truncation is destructive: adding a KaSA adapter permanently changes the layer's base weight.
+      Disabling or unloading the adapter does not restore the original weight, and `merge` followed by `unmerge`
+      round-trips to the truncated weight, not the original one. This is inherent to the method; keep the original
+      checkpoint if you need to recover the unmodified base model. For the same reason, KaSA adapters cannot be
+      combined with non-KaSA adapters on the same model, and `convert_to_lora` is not supported.
+    - The KaSA paper trains with two auxiliary regularizers (an L2 penalty on `lora_diag` and an orthogonal
+      regularization on `A`/`B`). These cannot be injected into the training loop by PEFT, so they are exposed through
+      `LoraModel._get_kasa_loss`, which the user should add to their task loss. Without them, the SVD interpretation of
+      the update is only approximate.
+
+    Args:
+        beta (`float`):
+            Coefficient `β` for the L2 (singular-value) regularization `||ΔΣ||_F^2 = sum(lora_diag ** 2)` (paper Eq.
+            9-10). Only takes effect if the user adds `LoraModel._get_kasa_loss` to their loss. Defaults to `1e-4` (the
+            value used in the reference GLUE configs).
+        gamma (`float`):
+            Coefficient `γ` for the orthogonal regularization `||B^T B - I||_F + ||A A^T - I||_F` (paper Eq. 11), which
+            softly enforces the semi-orthogonality of `ΔU`/`ΔV` assumed by the SVD parametrization. Only takes effect
+            if the user adds `LoraModel._get_kasa_loss` to their loss. Defaults to `1e-3` (the reference GLUE value).
+    """
+
+    beta: float = field(
+        default=1e-4,
+        metadata={
+            "help": (
+                "Coefficient `β` for the L2 (singular-value) regularization `sum(lora_diag ** 2)` (KaSA paper "
+                "Eq. 9-10). Only takes effect if the user adds `LoraModel._get_kasa_loss` to their training loss. "
+                "Defaults to 1e-4 (the reference GLUE value)."
+            )
+        },
+    )
+    gamma: float = field(
+        default=1e-3,
+        metadata={
+            "help": (
+                "Coefficient `γ` for the orthogonal regularization `||B^T B - I||_F + ||A A^T - I||_F` (KaSA paper "
+                "Eq. 11), which softly enforces the semi-orthogonality of the adapter factors assumed by the SVD "
+                "parametrization. Only takes effect if the user adds `LoraModel._get_kasa_loss` to their training "
+                "loss. Defaults to 1e-3 (the reference GLUE value)."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        if self.beta < 0:
+            raise ValueError(f"`beta` must be non-negative, got {self.beta}.")
+        if self.gamma < 0:
+            raise ValueError(f"`gamma` must be non-negative, got {self.gamma}.")
 
 
 @dataclass
@@ -371,6 +450,67 @@ class CordaConfig:
 
 
 @dataclass
+class AstraConfig:
+    """
+    This is the sub-configuration class to store the configuration of a [`LoraModel`] when using Astra.
+
+    Args:
+        cache_file (`Optional[str]`):
+            File to store the eigendecomposition cache. The cache is much smaller than the residual model (for example,
+            residual model of Llama-3-8b is 15GB, while the cache is 1.4GB), but with cache and original model weights,
+            residual model weights can be built quickly. If you need to reuse residual model weights with limited
+            storage, you can store the cache instead.
+        covariance_file (`Optional[str]`):
+            File to store the covariance matrix. If you wish to train multiple models with different ranks, but they
+            sample from the same dataset, you can store the covariance matrix and reuse it for different ranks. Note
+            that covariance file is usually large (comparable to model size), so you will need sufficient storage.
+        verbose (`bool`):
+            If true, prints the progress of Astra initialization. Defaults to `False`.
+        use_float16_for_covariance (`bool`):
+            If true, uses float16 for the covariance matrix. This can reduce the memory usage of the covariance matrix
+            by half, but may lead to numerical instability. Defaults to `False`.
+        prune_temporary_fields (`bool`):
+            If true, temporary fields generated in Astra preprocessing will be pruned. Defaults to `True`.
+    """
+
+    cache_file: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "File to store the eigendecomposition cache. The cache is much smaller than the residual model (for "
+                "example, residual model of Llama-3-8b is 15GB, while the cache is 1.4GB), but with cache and original "
+                "model weights, residual model weights can be built quickly. If you need to reuse residual model "
+                "weights with limited storage, you can store the cache instead."
+            )
+        },
+    )
+    covariance_file: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "File to store the covariance matrix. If you wish to train multiple models with different ranks, but "
+                "they sample from the same dataset, you can store the covariance matrix and reuse it for different "
+                "ranks. Note that covariance file is usually large (comparable to model size), so you will need "
+                "sufficient storage."
+            )
+        },
+    )
+    verbose: bool = field(default=False, metadata={"help": "If true, prints the progress of Astra initialization."})
+    use_float16_for_covariance: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If true, uses float16 for the covariance matrix. This can reduce the memory usage of the covariance "
+                "matrix by half, but may lead to numerical instability."
+            )
+        },
+    )
+    prune_temporary_fields: bool = field(
+        default=True, metadata={"help": "If true, temporary fields generated in Astra preprocessing will be pruned."}
+    )
+
+
+@dataclass
 class LoraConfig(PeftConfig):
     """
     This is the configuration class to store the configuration of a [`LoraModel`].
@@ -408,7 +548,7 @@ class LoraConfig(PeftConfig):
             use the original default value of `lora_alpha/r`.
         modules_to_save (`List[str]`):
             List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
-        init_lora_weights (`bool` | `Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "corda", "loftq", "orthogonal"]`):
+        init_lora_weights (`bool` | `Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "corda", "astra", "loftq", "orthogonal", "mica", "nora"]`):
             How to initialize the weights of the adapter layers. Passing True (default) results in the default
             initialization from the reference implementation from Microsoft, with the LoRA B weight being set to 0.
             This means that without further training, the LoRA adapter will be a no-op. Setting the initialization to
@@ -428,9 +568,22 @@ class LoraConfig(PeftConfig):
             using SVD. Passing `'corda'` results in the initialization of <a
             href='https://huggingface.co/papers/2406.05223' >Context-Oriented Decomposition Adaptation</a>, which
             converges even more rapidly than PiSSA in Instruction-Previewed Mode, and preserves world knowledge better
-            than LoRA in Knowledge-Preserved Mode. Passing `"orthogonal"` results in LoRA A and B being intialized
-            orthogonally; in this, it resembles `"olora"`, but the base weights are left untouched (requires `r` to be
-            even, only supported for linear layers for now).
+            than LoRA in Knowledge-Preserved Mode. Passing `'astra'` results in the initialization of <a
+            href='https://huggingface.co/papers/2602.19111' >Activation-Space Tail-Eigenvector Low-Rank Adaptation</a>,
+            which projects the base weight onto the eigenspace of the output activations estimated from a small
+            calibration dataset. Passing `"orthogonal"` results in LoRA A and B being initialized orthogonally; in
+            this, it resembles `"olora"`, but the base weights are left untouched (requires `r` to be even, only
+            supported for linear layers for now). Passing `"mica"` results in the initialization of <a
+            href='https://arxiv.org/abs/2604.01694' >Minor Component Adaptation (MiCA)</a>, which initializes B from
+            the r left singular vectors of the base weight associated with the smallest singular values, sets A to
+            zero, and freezes B during training; only A is updated. Currently supported for linear and embedding
+            layers. Passing `"nora"` results in the initialization of <a
+            href='https://huggingface.co/papers/2608.31036' >Normalized Low-Rank Adaptation (NoRA)</a>, which
+            normalizes each column of the randomly initialized LoRA A weight to unit L2 norm and sets the LoRA B weight
+            to zero. Normalization is applied only at initialization; the base weights are unchanged and both A and B
+            remain trainable. The recommended setting is `lora_alpha` equal to `r` with `use_rslora=False`, which keeps
+            a 1:1 ratio and a scaling factor of 1. Currently supported for linear layers and for `nn.Parameter`s
+            targeted with `target_parameters`.
         layers_to_transform (`Union[List[int], int]`):
             The layer indices to transform. If a list of ints is passed, it will apply the adapter to the layer indices
             that are specified in this list. If a single integer is passed, it will apply the transformations on the
@@ -461,13 +614,22 @@ class LoraConfig(PeftConfig):
         loftq_config (`Optional[LoftQConfig]`):
             The configuration of LoftQ. If this is not None, then LoftQ will be used to quantize the backbone weights
             and initialize Lora layers. Also pass `init_lora_weights='loftq'`. Note that you should not pass a
-            quantized model in this case, as LoftQ will quantize the model itself.
+            quantized model in this case, as LoftQ will quantize the model itself. LoftQ is only applied to linear
+            layers, including those targeted via `target_parameters`. Embedding and convolutional layers are not
+            supported and use the default LoRA initialization instead. `nn.MultiheadAttention` layers are not supported
+            and raise an error.
         eva_config (`Optional[EvaConfig]`):
             The configuration of EVA. At a minimum the dataset argument needs to be set (use the same dataset as for
             finetuning).
         corda_config (`Optional[CordaConfig]`):
             The configuration of CorDA. If this is not None, then CorDA will be used to build the adapter layers. Also
             pass `init_lora_weights='corda'`.
+        astra_config (`Optional[AstraConfig]`):
+            The configuration of Astra. If this is not None, then Astra will be used to build the adapter layers. Also
+            pass `init_lora_weights='astra'`, and call `preprocess_astra` before `get_peft_model` in this case.
+        lora_ga_config (`Optional[LoraGAConfig]`):
+            The configuration of LoRA-GA. If this is passed, then LoRA-GA will be used to initialize the adapter
+            layers. Also set `init_lora_weights='lora_ga'` in this case.
         use_dora (`bool`):
             Enable 'Weight-Decomposed Low-Rank Adaptation' (DoRA). This technique decomposes the updates of the weights
             into two parts, magnitude and direction. Direction is handled by normal LoRA, whereas the magnitude is
@@ -478,6 +640,10 @@ class LoraConfig(PeftConfig):
         velora_config (`Optional[VeloraConfig]`):
             Enable VeLoRA by providing a VeloraConfig. VeLoRA swaps in a custom backward pass for the LoRA A projection
             that stores compressed activations instead of the full input activations.
+        kasa_config (`Optional[KasaConfig]`):
+            Enable KaSA (Knowledge-aware Singular-value Adaptation) by providing a KasaConfig. KaSA truncates the `r`
+            smallest singular components of the frozen base weight via a one-time SVD and inserts a learnable diagonal
+            of singular values between the LoRA A and B factors. Currently only linear layers are supported.
         alora_invocation_tokens (`List[int]`):
             If not None, enable <a href='https://huggingface.co/papers/2504.12397'>'Activated LoRA' (aLoRA)</a>, with
             alora_invocation_tokens being the tokenized invocation string for the adapter (must be present in all model
@@ -489,6 +655,21 @@ class LoraConfig(PeftConfig):
             operations. Overall adapter inference speedups of an order of magnitude or more can occur on vLLM,
             depending on the length of the shared context. Note that merging is not possible due to the selective
             application of the weights.
+        use_qalora (`bool`):
+            It is only implemented in GPTQ for now. Enable <a
+            href='https://huggingface.co/papers/2309.14717'>Quantization-Aware Low-Rank Adaptation (QALoRA)</a>. This
+            technique combines quantization-aware training with LoRA to improve performance for quantized models. This
+            can improve the performance of LoRA, especially at low ranks. Right now, QALoRA only supports linear
+            layers.
+        qalora_group_size (`int`):
+            Group size parameter for QALoRA pooling, controlling the dimension reduction factor. Input dimensions are
+            pooled into groups of this size, reducing the computational cost. Higher values provide more compression
+            but may reduce model quality. This parameter determines how many original features are averaged together to
+            create one pooled feature. Only used when `use_qalora=True`.
+        monteclora_config (`Optional[MontecloraConfig]`):
+            The configuration of Monteclora (Monte Carlo Low-Rank Adaptation). If passed, Monteclora will be used to
+            add variational Monte Carlo sampling on top of the LoRA adapters. See `MontecloraConfig` for details on the
+            individual hyperparameters.
         layer_replication (`List[Tuple[int, int]]`):
             Build a new stack of layers by stacking the original model layers according to the ranges specified. This
             allows expanding (or shrinking) the model without duplicating the base model weights. The new layers will
@@ -500,15 +681,23 @@ class LoraConfig(PeftConfig):
             disabled. The main use case for this is when the LoRA weights were extracted from fully fine-tuned
             parameters so the bias of those parameters can be taken into account.
         target_parameters (`List[str]`, *optional*)
-            List of parameter names or regex expression of the parameter names to replace with LoRA. This argument
-            behaves similarly to `target_modules`, except that the parameter name should be passed. Generally, you
-            should use `target_modules` to target the module (e.g. `nn.Linear`). However, in some circumstances, this
-            is not possible. E.g., in many mixture of expert (MoE) layers in HF Transformers, instead of using
-            `nn.Linear`, an `nn.Parameter` is used. PEFT normally overwrites the `forward` method for LoRA, but for
-            `nn.Parameter`, there is none. Therefore, to apply LoRA to that parameter, it needs to be targeted with
+            List of parameter names of the parameter names to replace with LoRA. This argument behaves similarly to
+            `target_modules`, except that the parameter name should be passed. Generally, you should use
+            `target_modules` to target the module (e.g. `nn.Linear`). However, in some circumstances, this is not
+            possible. E.g., in many mixture of expert (MoE) layers in HF Transformers, instead of using `nn.Linear`, an
+            `nn.Parameter` is used. PEFT normally overwrites the `forward` method for LoRA, but for `nn.Parameter`,
+            there is none. Therefore, to apply LoRA to that parameter, it needs to be targeted with
             `target_parameters`. As an example, for Llama4, you can pass:
             `target_parameters=['feed_forward.experts.gate_up_proj', 'feed_forward.experts.down_proj]`. Passing a
-            string for regex matching is not implemented yet.
+            string for regex matching is not implemented yet. Note that when the model is compiled and uses
+            `target_parameters`, re-compilation and/or graph breaks are expected. It is recommended not to use both at
+            the same time.
+        use_bdlora (`Optional[BdLoraConfig]`):
+            Enable BD-LoRA (Block-Diagonal LoRA) by providing a BdLoraConfig. This technique uses block-diagonal
+            matrices for LoRA-A or LoRA-B factors to enable faster multi-LoRA serving by eliminating communication
+            overheads in distributed settings.
+        arrow_config (`Optional[ArrowConfig]`):
+            The necessary config to apply arrow routing on the model.
         ensure_weight_tying (`bool`, *optional*)
             Whether to tie weights or not after peft initialization. This will ensure that the adapters added to the
             tied layers are also tied. This is only applicable for layers passed via `modules_to_save` and
@@ -521,7 +710,7 @@ class LoraConfig(PeftConfig):
         default=None,
         metadata={
             "help": (
-                "List of module names or regex expression of the module names to replace with LoRA. "
+                "List of module names of the module names to replace with LoRA. "
                 "For example, ['q', 'v'] or '.*decoder.*(SelfAttention|EncDecAttention).*(q|v)$'. "
                 "This can also be a wildcard 'all-linear' which matches all linear/Conv1D "
                 "(if the model is a PreTrainedModel, the output layer excluded). "
@@ -566,7 +755,19 @@ class LoraConfig(PeftConfig):
     )
     init_lora_weights: (
         bool
-        | Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "corda", "loftq", "orthogonal"]
+        | Literal[
+            "gaussian",
+            "eva",
+            "olora",
+            "pissa",
+            "pissa_niter_[number of iters]",
+            "corda",
+            "astra",
+            "loftq",
+            "orthogonal",
+            "mica",
+            "nora",
+        ]
     ) = field(
         default=True,
         metadata={
@@ -585,9 +786,22 @@ class LoraConfig(PeftConfig):
                 "[number of iters] indicates the number of subspace iterations to perform fsvd, and must be a "
                 "nonnegative integer. "
                 "Passing `'corda'` results in CorDA initialization. "
+                "Passing `'astra'` results in Astra initialization. "
                 "Pass `'loftq'` to use LoftQ initialization. "
-                "Pass `'orthogonal'` for orthogonal initialization of LoRA A and B."
+                "Pass `'orthogonal'` for orthogonal initialization of LoRA A and B. "
+                "Pass `'mica'` to use MiCA initialization, where B is set to the r left singular vectors of the "
+                "base weight associated with the smallest singular values, A is set to zero, and B is frozen during "
+                "training (only A is updated). "
+                "Pass 'nora' to use NoRA initialization, which normalizes each column of the randomly initialized "
+                "LoRA A weight to unit L2 norm and sets the LoRA B weight to zero. Normalization is applied only at "
+                "initialization; the base weights are unchanged and both A and B remain trainable. The recommended "
+                "setting is lora_alpha equal to r with use_rslora=False, which keeps a 1:1 ratio and a scaling "
+                "factor of 1. Currently supported for linear layers and for nn.Parameters targeted with "
+                "target_parameters."
             ),
+            # lora_variants: lists the string values (or prefixes) of init_lora_weights
+            # that activate a LoRA variant (e.g. "mica" activates MiCALinearVariant).
+            "lora_variants": ["mica"],
         },
     )
     layers_to_transform: Optional[Union[list[int], int]] = field(
@@ -669,7 +883,10 @@ class LoraConfig(PeftConfig):
         metadata={
             "help": (
                 "The configuration of LoftQ. If this is passed, then LoftQ will be used to quantize the backbone "
-                "weights and initialize Lora layers. Also set `init_lora_weights='loftq'` in this case."
+                "weights and initialize Lora layers. Also set `init_lora_weights='loftq'` in this case. "
+                "LoftQ is only applied to linear layers, including those targeted via `target_parameters`. Embedding "
+                "and convolutional layers are not supported and use the default LoRA initialization instead. "
+                "`nn.MultiheadAttention` layers are not supported and raise an error."
             )
         },
     )
@@ -691,6 +908,16 @@ class LoraConfig(PeftConfig):
             )
         },
     )
+    astra_config: Optional[AstraConfig] = field(
+        default=None,
+        metadata={
+            "help": (
+                "The configuration of Astra. If this is passed, then Astra will be used to build the adapter layers. "
+                "Also set `init_lora_weights='astra'` and call `preprocess_astra` before `get_peft_model` in this "
+                "case."
+            )
+        },
+    )
     lora_ga_config: Optional[LoraGAConfig] = field(
         default=None,
         metadata={
@@ -709,7 +936,8 @@ class LoraConfig(PeftConfig):
                 "magnitude is handled by a separate learnable parameter. This can improve the performance of LoRA, "
                 "especially at low ranks. Right now, DoRA only supports linear and Conv2D layers. DoRA introduces a bigger"
                 "overhead than pure LoRA, so it is recommended to merge weights for inference."
-            )
+            ),
+            "is_lora_variant": True,
         },
     )
     velora_config: Optional[Union[VeloraConfig, dict]] = field(
@@ -718,7 +946,8 @@ class LoraConfig(PeftConfig):
             "help": (
                 "Enable VeLoRA as a LoRA variant by providing a VeloraConfig. VeLoRA swaps in a custom backward pass "
                 "for the LoRA A projection that stores compressed activations instead of the full input activations."
-            )
+            ),
+            "is_lora_variant": True,
         },
     )
     alora_invocation_tokens: Optional[list[int]] = field(
@@ -735,7 +964,8 @@ class LoraConfig(PeftConfig):
                 "operations. Overall adapter inference speedups of an order of magnitude or more can occur on vLLM, "
                 "depending on the length of the shared context. Note that merging is not possible due to the selective "
                 "application of the weights."
-            )
+            ),
+            "is_lora_variant": True,
         },
     )
     use_qalora: bool = field(
@@ -759,6 +989,18 @@ class LoraConfig(PeftConfig):
                 "This parameter determines how many original features are averaged together to create "
                 "one pooled feature. Only used when `use_qalora=True`."
             )
+        },
+    )
+
+    monteclora_config: Optional[MontecloraConfig] = field(
+        default=None,
+        metadata={
+            "help": (
+                "The configuration of Monteclora (Monte Carlo Low-Rank Adaptation). If passed, Monteclora will be "
+                "used to add variational Monte Carlo sampling on top of the LoRA adapters. See `MontecloraConfig` "
+                "for details on the individual hyperparameters."
+            ),
+            "is_lora_variant": True,
         },
     )
     # Enables replicating layers in a model to expand it to a larger model.
@@ -806,7 +1048,9 @@ class LoraConfig(PeftConfig):
                 "method for LoRA, but for `nn.Parameter`, there is none. Therefore, to apply LoRA to that parameter, "
                 "it needs to be targeted with `target_parameters`. As an example, for Llama4, you can pass: "
                 "`target_parameters=['feed_forward.experts.gate_up_proj', 'feed_forward.experts.down_proj]`. Passing a "
-                "string for regex matching is not implemented yet."
+                "string for regex matching is not implemented yet. Note that when the model is compiled and uses "
+                "`target_parameters`, re-compilation and/or graph breaks are expected. It is recommended not to use "
+                "both at the same time."
             )
         },
     )
@@ -816,11 +1060,29 @@ class LoraConfig(PeftConfig):
             "help": (
                 "Enable BD-LoRA (Block-Diagonal LoRA) by providing a BdLoraConfig. This technique uses block-diagonal matrices for LoRA-A or LoRA-B "
                 "factors to enable faster multi-LoRA serving by eliminating communication overheads in distributed settings."
-            )
+            ),
+            "is_lora_variant": True,
         },
     )
     arrow_config: Optional[ArrowConfig] = field(
-        default=None, metadata={"help": "The necessary config to apply arrow routing on the model."}
+        default=None,
+        metadata={
+            "help": "The necessary config to apply arrow routing on the model.",
+            "is_lora_variant": True,
+        },
+    )
+    kasa_config: Optional[KasaConfig] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enable KaSA (Knowledge-aware Singular-value Adaptation) as a LoRA variant by providing a "
+                "`KasaConfig`. KaSA truncates the `r` smallest singular components of the frozen base weight via a "
+                "one-time SVD and parametrizes the trainable update with a learnable diagonal of singular values "
+                "(`lora_diag`) inserted between the LoRA A and B factors. Currently only linear layers are "
+                "supported. See `KasaConfig` for details on the individual hyperparameters."
+            ),
+            "is_lora_variant": True,
+        },
     )
     ensure_weight_tying: bool = field(
         default=False,
@@ -845,6 +1107,8 @@ class LoraConfig(PeftConfig):
     def __post_init__(self):
         super().__post_init__()
         self.peft_type = PeftType.LORA
+        if isinstance(self.monteclora_config, dict):
+            self.monteclora_config = MontecloraConfig(**self.monteclora_config)
         self.target_modules = (
             set(self.target_modules) if isinstance(self.target_modules, list) else self.target_modules
         )
@@ -856,13 +1120,22 @@ class LoraConfig(PeftConfig):
             self.modules_to_tie = None
             self.target_modules_to_tie = None
 
-        if isinstance(self.velora_config, dict):
-            self.velora_config = VeloraConfig(**self.velora_config)
-        elif self.velora_config is not None and not isinstance(self.velora_config, VeloraConfig):
-            raise TypeError("`velora_config` must be a `VeloraConfig`, a dict, or None.")
+        # Nested sub-configs: save_pretrained serializes them via asdict, so after loading from a checkpoint they
+        # arrive as plain dicts and must be converted back (see issue #3583). Unified handling for all variants
+        # via _get_lora_subconfig — it also validates that the value is None, an instance, or a dict.
+        self.velora_config = _get_lora_subconfig(self.velora_config, VeloraConfig)
+        self.kasa_config = _get_lora_subconfig(self.kasa_config, KasaConfig)
+        self.eva_config = _get_lora_subconfig(self.eva_config, EvaConfig)
+        self.corda_config = _get_lora_subconfig(self.corda_config, CordaConfig)
+        self.astra_config = _get_lora_subconfig(self.astra_config, AstraConfig)
+        self.lora_ga_config = _get_lora_subconfig(self.lora_ga_config, LoraGAConfig)
+        self.arrow_config = _get_lora_subconfig(self.arrow_config, ArrowConfig)
+        self.use_bdlora = _get_lora_subconfig(self.use_bdlora, BdLoraConfig)
 
         if isinstance(self.target_parameters, str):
             raise TypeError("`target_parameters` must be a list of strings or None.")
+        if self.target_parameters and self.init_lora_weights == "astra":
+            raise ValueError("`target_parameters` is not supported with Astra, please use `target_modules` instead.")
 
         # if target_modules is a regex expression, then layers_to_transform should be None
         if isinstance(self.target_modules, str) and self.layers_to_transform is not None:
@@ -873,7 +1146,7 @@ class LoraConfig(PeftConfig):
             raise ValueError("`layers_pattern` cannot be used when `target_modules` is a str.")
 
         # check for layers_to_transform and layers_pattern
-        if self.layers_pattern and not self.layers_to_transform:
+        if self.layers_pattern and self.layers_to_transform is None:
             raise ValueError("When `layers_pattern` is specified, `layers_to_transform` must also be specified. ")
 
         if self.use_dora and self.megatron_config:
@@ -906,6 +1179,14 @@ class LoraConfig(PeftConfig):
         elif self.init_lora_weights != "corda" and self.corda_config is not None:
             warnings.warn("`corda_config` specified but will be ignored when `init_lora_weights` is not 'corda'.")
 
+        elif self.init_lora_weights == "astra" and self.astra_config is None:
+            warnings.warn(
+                "`init_lora_weights` is 'astra' but `astra_config` is not specified. Using default Astra config."
+            )
+            self.astra_config = AstraConfig()
+        elif self.init_lora_weights != "astra" and self.astra_config is not None:
+            warnings.warn("`astra_config` specified but will be ignored when `init_lora_weights` is not 'astra'.")
+
         if self.lora_bias:
             if self.init_lora_weights not in (True, False):
                 raise ValueError(
@@ -929,6 +1210,7 @@ class LoraConfig(PeftConfig):
                 (isinstance(self.init_lora_weights, str) and (self.init_lora_weights.startswith("pissa")))
                 or (self.init_lora_weights == "olora")
                 or (self.init_lora_weights == "corda")
+                or (self.init_lora_weights == "astra")
                 or (self.init_lora_weights == "lora_ga")
             )
         ):
@@ -999,3 +1281,92 @@ class LoraGAConfig:
         default="stable", metadata={"help": "Scaling strategy for initialization"}
     )
     stable_gamma: int = field(default=16, metadata={"help": "Gamma parameter for stable scaling"})
+
+
+@dataclass
+class MontecloraConfig:
+    """
+    This is the sub-configuration class to store the configuration for Monteclora (Monte Carlo Low-Rank Adaptation).
+    Monteclora introduces variational inference into LoRA by adding Monte Carlo sampling to the adapter weights.
+
+    In practice you can think of Monteclora as adding stochastic, learned perturbations on top of the LoRA weights to
+    obtain a better-calibrated and better-regularized adapter. The arguments below let you trade off stability,
+    regularization strength, and compute cost.
+
+    Args:
+        num_samples (`int`):
+            Number of Monte Carlo samples to draw per forward pass. Higher values usually give smoother training and
+            better uncertainty estimates but increase compute and memory usage. Lower this if training is too slow or
+            memory constrained; increase it if training is stable and you want stronger Monte Carlo averaging.
+        use_entropy (`bool`):
+            Whether to add an entropy regularization term that keeps the Monte Carlo weights from collapsing to a
+            single sample. Turn this on if you observe the sampler becoming very peaky or want stronger regularization;
+            leave it off to mimic standard LoRA more closely.
+        dirichlet_prior (`float`):
+            Concentration parameter for the Dirichlet prior over sample/expert weights. Larger values push the weights
+            towards being more uniform (stronger regularization, less sparsity), while smaller positive values
+            encourage sparser, more peaked weights. Increase if the sampler overfits; decrease (but keep > 0) if it is
+            too conservative.
+        sample_scaler (`float`):
+            Overall scaling factor for the sampled perturbations applied to the LoRA weights. Increasing this makes the
+            Monte Carlo noise stronger (more regularization and exploration, but also more training instability);
+            decreasing it moves the behavior closer to standard deterministic LoRA. Setting it very close to 0 largely
+            disables the effect of Monteclora.
+        kl_loss_weight (`float`):
+            Weight of the KL-divergence term between the variational distribution and its prior. Larger values put more
+            emphasis on matching the prior (stronger regularization, potentially underfitting); smaller values rely
+            more on the data likelihood (weaker regularization, potentially overfitting). Tune this if you find
+            Monteclora over- or under-regularizing the adapter.
+        buffer_size (`int`):
+            Size of the internal buffer used by the Monte Carlo sampler (e.g. for storing recent statistics). Larger
+            values can stabilize the estimated variational parameters at the cost of additional memory; reduce this if
+            you are memory constrained.
+    """
+
+    num_samples: int = field(
+        default=8,
+        metadata={
+            "help": (
+                "Number of Monte Carlo samples to draw per forward pass. Higher values usually give smoother "
+                "training and better uncertainty estimates but increase compute and memory usage. Lower this if "
+                "training is too slow or memory constrained; increase it if training is stable and you want "
+                "stronger Monte Carlo averaging."
+            )
+        },
+    )
+    use_entropy: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to add an entropy regularization term that keeps the Monte Carlo weights from collapsing "
+                "to a single sample. Turn this on if you observe the sampler becoming very peaky or want stronger "
+                "regularization."
+            )
+        },
+    )
+    dirichlet_prior: float = field(
+        default=0.1,
+        metadata={"help": "Prior parameter for Dirichlet distribution used in expert weight sampling."},
+    )
+    sample_scaler: float = field(
+        default=1e-4,
+        metadata={
+            "help": "Scaling factor for the Monte Carlo samples. Controls the magnitude of variational perturbations."
+        },
+    )
+    kl_loss_weight: float = field(
+        default=1e-5,
+        metadata={"help": "Weight for the KL divergence loss component in the variational objective."},
+    )
+    buffer_size: int = field(
+        default=150,
+        metadata={"help": "Size of the buffer for the Monte Carlo sampler."},
+    )
+
+    def __post_init__(self):
+        if self.num_samples <= 0:
+            raise ValueError("`num_samples` must be greater than 0.")
+        if self.dirichlet_prior <= 0:
+            raise ValueError("`dirichlet_prior` must be greater than 0.")
+        if self.buffer_size <= 0:
+            raise ValueError("`buffer_size` must be greater than 0.")

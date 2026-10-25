@@ -31,12 +31,15 @@ from peft import (
     LoHaConfig,
     LoKrConfig,
     LoraConfig,
+    OFTConfig,
     PeftMixedModel,
+    PeftModel,
     PrefixTuningConfig,
+    ShiraConfig,
     get_peft_model,
 )
 from peft.tuners.tuners_utils import BaseTunerLayer
-from peft.utils import infer_device
+from peft.utils import AuxiliaryTrainingWrapper, infer_device
 
 
 class SimpleNet(nn.Module):
@@ -178,6 +181,25 @@ class TestMixedAdapterTypes(unittest.TestCase):
         if is_commutative:
             assert torch.allclose(output_mixed_reversed, output_mixed_01, atol=atol, rtol=rtol)
             assert torch.allclose(output_mixed_reversed, output_mixed_10, atol=atol, rtol=rtol)
+
+    def test_inference_mode_controls_mixed_adapter_dropouts(self):
+        model = get_peft_model(
+            SimpleNet(),
+            LoraConfig(target_modules=["lin0"], lora_dropout=0.5),
+            adapter_name="adapter_lora",
+            mixed=True,
+        )
+        model.add_adapter("adapter_oft", OFTConfig(target_modules=["lin1"], module_dropout=0.5, oft_block_size=20))
+        model.set_adapter(["adapter_lora", "adapter_oft"], inference_mode=True)
+
+        assert not model.base_model.model.lin0.lora_dropout["adapter_lora"].training
+        assert not model.base_model.model.lin1.oft_dropout["adapter_oft"].training
+        assert model.base_model.model.lin0.training
+        assert model.base_model.model.lin1.training
+
+        model.set_adapter(["adapter_lora", "adapter_oft"], inference_mode=False)
+        assert model.base_model.model.lin0.lora_dropout["adapter_lora"].training
+        assert model.base_model.model.lin1.oft_dropout["adapter_oft"].training
 
     def _check_merging(self, model_cls, config0, config1, input):
         # Ensure that when merging mixed adapters, the result is the same as when applying the adapters separately.
@@ -651,6 +673,76 @@ class TestMixedAdapterTypes(unittest.TestCase):
         output_deleted_01 = peft_model(input)
         assert torch.allclose(output_deleted_01, output_base, atol=atol, rtol=rtol)
 
+    def test_delete_merged_adapter_is_atomic(self):
+        model = SimpleNet().eval().to(self.torch_device)
+        config0 = LoraConfig(target_modules=["lin0"])
+        peft_model = get_peft_model(model, config0, "adapter0", mixed=True)
+        config1 = LoHaConfig(target_modules=["lin1"])
+        peft_model.add_adapter("adapter1", config1)
+        peft_model.base_model.merge_adapter(adapter_names=["adapter1"])
+
+        msg = "Cannot delete adapter(s) ['adapter1'] while they are merged. Please unmerge them first."
+        with pytest.raises(ValueError, match=re.escape(msg)):
+            peft_model.delete_adapter(["adapter0", "adapter1"])
+
+        assert set(peft_model.peft_config) == {"adapter0", "adapter1"}
+        available_adapters = set()
+        for module in peft_model.modules():
+            if isinstance(module, BaseTunerLayer):
+                available_adapters.update(module._all_available_adapter_names())
+        assert available_adapters == {"adapter0", "adapter1"}
+
+        # "adapter0" is not merged, so deleting it on its own works while "adapter1" stays merged
+        peft_model.delete_adapter(["adapter0"])
+        assert set(peft_model.peft_config) == {"adapter1"}
+
+        peft_model.base_model.unmerge_adapter()
+        peft_model.delete_adapter(["adapter1"])
+        assert not peft_model.peft_config
+
+    def test_delete_active_adapter_keeps_remaining_adapter_active(self):
+        # Deleting the active LoRA adapter must keep the surviving LoHa adapter active even though it lives on a
+        # different layer and is therefore absent from the first tuner layer visited during deletion.
+        model = SimpleNet().eval().to(self.torch_device)
+        peft_model = get_peft_model(model, LoraConfig(target_modules=["lin0"]), "adapter0", mixed=True)
+        peft_model.add_adapter("adapter1", LoHaConfig(target_modules=["lin1"]))
+        peft_model.base_model.set_adapter("adapter0")
+
+        peft_model.delete_adapter("adapter0")
+
+        assert set(peft_model.peft_config) == {"adapter1"}
+        assert peft_model.active_adapters == ["adapter1"]
+        for module in peft_model.modules():
+            if isinstance(module, BaseTunerLayer) and "adapter1" in module._all_available_adapter_names():
+                assert module.active_adapters == ["adapter1"]
+
+    @parameterized.expand(["modules_to_save", "trainable_tokens"])
+    def test_delete_multiple_adapters_removes_every_auxiliary_adapter(self, auxiliary_type):
+        # Deleting multiple adapters in one call must remove every auxiliary entry in either input order. Previously,
+        # cleanup ran only for the final loop item and left the other adapter's auxiliary entry behind.
+        for names in (["adapter0", "adapter1"], ["adapter1", "adapter0"]):
+            model = SimpleNet().eval().to(self.torch_device)
+            if auxiliary_type == "modules_to_save":
+                config0 = LoraConfig(target_modules=["lin0"], modules_to_save=["lin1"])
+                config1 = LoHaConfig(target_modules=["lin0"], modules_to_save=["lin1"])
+            else:
+                model.emb = nn.Embedding(10, 10).to(self.torch_device)
+                config0 = LoraConfig(target_modules=["lin0"], trainable_token_indices={"emb": [0, 1]})
+                config1 = LoraConfig(target_modules=["lin0"], trainable_token_indices={"emb": [0, 1]})
+
+            peft_model = get_peft_model(model, config0, "adapter0", mixed=True)
+            peft_model.add_adapter("adapter1", config1)
+
+            wrappers = [m for m in peft_model.modules() if isinstance(m, AuxiliaryTrainingWrapper)]
+            assert wrappers
+            assert all(w._get_available_adapters() == {"adapter0", "adapter1"} for w in wrappers)
+
+            peft_model.delete_adapter(names)
+
+            assert not peft_model.peft_config
+            for wrapper in wrappers:
+                assert not wrapper._get_available_adapters(), f"leftover after deleting {names}"
+
     def test_modules_to_save(self):
         model = SimpleNet().eval().to(self.torch_device)
         config0 = LoraConfig(target_modules=["lin0"], modules_to_save=["lin1"])
@@ -662,6 +754,41 @@ class TestMixedAdapterTypes(unittest.TestCase):
         peft_model.add_adapter("adapter1", config1)
         with pytest.raises(ValueError, match="Only one adapter can be set at a time for ModulesToSaveWrapper"):
             peft_model.set_adapter(["adapter0", "adapter1"])
+
+    def test_unload_modules_to_save_when_active_adapter_does_not_use_it(self):
+        # Unloading used to crash when the active adapter did not use modules_to_save on a wrapped module; see
+        # TestModulesToSaveUnloadNoActiveAdapter in test_other.py. This covers MixedModel's separate unload path.
+        atol = 1e-5
+        rtol = 1e-5
+        input = torch.arange(90).reshape(9, 10).to(self.torch_device)
+
+        config0 = LoraConfig(target_modules=["lin0"], modules_to_save=["lin1"])
+        peft_model = self._get_model(SimpleNet, config0, "adapter0")
+        torch.manual_seed(1)
+        config1 = LoHaConfig(target_modules=["lin0"], init_weights=False)
+        peft_model.add_adapter("adapter1", config1)
+        peft_model.set_adapter(["adapter1"])
+
+        # modify the modules_to_save copy of adapter0 to ensure that unloading does not use it
+        lin1_weight_before = peft_model.base_model.model.lin1.original_module.weight.data.clone()
+        peft_model.base_model.model.lin1.modules_to_save["adapter0"].weight.data.fill_(42.0)
+        output_peft = peft_model(input)
+
+        model_merged = copy.deepcopy(peft_model).merge_and_unload()
+        assert isinstance(model_merged.lin1, nn.Linear)
+        assert torch.equal(model_merged.lin1.weight.data, lin1_weight_before)
+        output_merged = model_merged(input)
+        # merging must reproduce the output of the model with adapter1 active; merging requires a bit higher
+        # tolerance, like in _check_merging
+        assert torch.allclose(output_peft, output_merged, atol=1e-4, rtol=1e-4)
+
+        model_unloaded = peft_model.unload()
+        assert isinstance(model_unloaded.lin1, nn.Linear)
+        assert torch.equal(model_unloaded.lin1.weight.data, lin1_weight_before)
+        output_unloaded = model_unloaded(input)
+        # unloading without merging must restore the base model output
+        output_base = self._get_model(SimpleNet)(input)
+        assert torch.allclose(output_base, output_unloaded, atol=atol, rtol=rtol)
 
     def test_get_nb_trainable_parameters(self):
         model = SimpleNet().eval().to(self.torch_device)
@@ -691,6 +818,17 @@ class TestMixedAdapterTypes(unittest.TestCase):
         # remove 2 params because we need to exclude "ranknum" for AdaLora trainable params
         assert trainable_params2 == (((params_lora + params_loha) + params_adalora) - 2)
         assert all_param2 == (((params_base + params_lora) + params_loha) + params_adalora)
+
+    def test_bias_only_honored_for_non_lora_tuner(self):
+        # `bias="<prefix>_only"` should be honored for any mixed-compatible tuner, not just LoRA. Previously the
+        # mixed model hardcoded `bias == "lora_only"` and raised `ValueError: Requested bias: oft_only, is not
+        # implemented.` for e.g. OFT, even though standalone OFT supports `bias="oft_only"`.
+        model = SimpleNet().eval().to(self.torch_device)
+        config = OFTConfig(target_modules=["lin1"], oft_block_size=8, bias="oft_only")
+        peft_model = get_peft_model(model, config, "adapter0", mixed=True)
+
+        trainable_biases = [n for n, p in peft_model.named_parameters() if n.endswith("bias") and p.requires_grad]
+        assert trainable_biases, "expected at least one trainable bias with bias='oft_only'"
 
     def test_incompatible_config_raises(self):
         model = SimpleNet().eval().to(self.torch_device)
@@ -789,3 +927,74 @@ class TestMixedAdapterTypes(unittest.TestCase):
             assert torch.isfinite(output01_loaded).all()
             assert not torch.allclose(output0_save, output01_loaded, atol=atol, rtol=rtol)
             assert not torch.allclose(output1_save, output01_loaded, atol=atol, rtol=rtol)
+
+
+class TestMixedAdapterLoading:
+    @pytest.mark.parametrize("is_trainable", [False, True])
+    @pytest.mark.parametrize(
+        "config",
+        [
+            LoraConfig(target_modules=["lin0"], init_lora_weights=False),
+            LoHaConfig(target_modules=["lin0"], init_weights=False),
+            LoKrConfig(target_modules=["lin0"], init_weights=False),
+            AdaLoraConfig(target_modules=["lin0"], init_lora_weights=False, total_step=1),
+            ShiraConfig(target_modules=["lin0"], r=2, init_weights=False),
+            LoraConfig(target_modules=["lin0"], modules_to_save=["lin1"], init_lora_weights=False),
+        ],
+        ids=["lora", "loha", "lokr", "adalora", "shira", "modules_to_save"],
+    )
+    def test_from_pretrained_trainability(self, tmp_path, config, is_trainable):
+        # Regression for #3823: PeftMixedModel must preserve requires_grad just as PeftModel does.
+        base_model = SimpleNet()
+        saved_model = get_peft_model(copy.deepcopy(base_model), config)
+        saved_model.save_pretrained(tmp_path)
+
+        regular_model = PeftModel.from_pretrained(copy.deepcopy(base_model), tmp_path, is_trainable=is_trainable)
+        mixed_model = PeftMixedModel.from_pretrained(copy.deepcopy(base_model), tmp_path, is_trainable=is_trainable)
+
+        expected = {name: param.requires_grad for name, param in regular_model.named_parameters()}
+        actual = {name: param.requires_grad for name, param in mixed_model.named_parameters()}
+        assert actual == expected
+        assert mixed_model.active_adapters == ["default"]
+        assert mixed_model.peft_config["default"].inference_mode == (not is_trainable)
+        inputs = torch.ones(2, 10)
+        torch.testing.assert_close(mixed_model(inputs), regular_model(inputs))
+
+    @pytest.mark.parametrize("first_trainable", [False, True])
+    @pytest.mark.parametrize("second_trainable", [False, True])
+    @pytest.mark.parametrize("modules_to_save", [None, ["lin1"]])
+    @pytest.mark.parametrize("second_config_class", [LoHaConfig, OFTConfig])
+    def test_load_adapter_preserves_trainability(
+        self, tmp_path, first_trainable, second_trainable, modules_to_save, second_config_class
+    ):
+        # first_trainable=True leaves the first adapter trainable except for lora_A, frozen below; False freezes it all.
+        # second_trainable sets requires_grad for the second adapter, which stays inactive in both cases.
+        # Vary modules_to_save and the second adapter type for coverage.
+        base_model = SimpleNet()
+
+        first_config = LoraConfig(target_modules=["lin0"], modules_to_save=modules_to_save, init_lora_weights=False)
+        first_model = get_peft_model(copy.deepcopy(base_model), first_config)
+        first_model.save_pretrained(tmp_path / "first")
+
+        second_config = second_config_class(
+            target_modules=["lin0"], modules_to_save=modules_to_save, init_weights=False
+        )
+        second_model = get_peft_model(copy.deepcopy(base_model), second_config)
+        second_model.save_pretrained(tmp_path / "second")
+
+        model = PeftMixedModel.from_pretrained(copy.deepcopy(base_model), tmp_path / "first")
+        model.set_adapter("default", inference_mode=not first_trainable)
+        # Loading must also preserve a caller's freeze on one parameter of an otherwise trainable adapter.
+        model.base_model.model.lin0.lora_A["default"].weight.requires_grad_(False)
+        existing = [(param, param.requires_grad) for param in model.parameters()]
+        inputs = torch.ones(2, 10)
+        expected_output = model(inputs)
+
+        model.load_adapter(tmp_path / "second", "second", is_trainable=second_trainable)
+
+        assert all(param.requires_grad == requires_grad for param, requires_grad in existing)
+        second_parameters = [param for name, param in model.named_parameters() if "second" in name.split(".")]
+        assert second_parameters
+        assert all(param.requires_grad == second_trainable for param in second_parameters)
+        assert model.active_adapters == ["default"]
+        torch.testing.assert_close(model(inputs), expected_output)

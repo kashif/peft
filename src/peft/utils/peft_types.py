@@ -16,7 +16,7 @@ import enum
 from typing import Optional
 
 
-class PeftType(str, enum.Enum):
+class PeftType(str, enum.Enum):  # noqa: UP042
     """
     Enum class for the different types of adapters in PEFT.
 
@@ -38,6 +38,7 @@ class PeftType(str, enum.Enum):
     - POLY
     - LN_TUNING
     - VERA
+    - FROD
     - FOURIERFT
     - HRA
     - BONE
@@ -51,6 +52,8 @@ class PeftType(str, enum.Enum):
     - DELORA
     - GRALORA
     - ADAMSS
+    - SHADOW
+    - DEFT
     """
 
     PROMPT_TUNING = "PROMPT_TUNING"
@@ -71,11 +74,14 @@ class PeftType(str, enum.Enum):
     POLY = "POLY"
     LN_TUNING = "LN_TUNING"
     VERA = "VERA"
+    FROD = "FROD"
     PVERA = "PVERA"
     FOURIERFT = "FOURIERFT"
+    GLORA = "GLORA"
     XLORA = "XLORA"
     HRA = "HRA"
     VBLORA = "VBLORA"
+    UNILORA = "UNILORA"
     CPT = "CPT"
     MISS = "MISS"
     RANDLORA = "RANDLORA"
@@ -92,9 +98,12 @@ class PeftType(str, enum.Enum):
     TINYLORA = "TINYLORA"
     PSOFT = "PSOFT"
     PEANUT = "PEANUT"
+    SHADOW = "SHADOW"
+    SUPERTUNING = "SUPERTUNING"
+    DEFT = "DEFT"
 
 
-class TaskType(str, enum.Enum):
+class TaskType(str, enum.Enum):  # noqa: UP042
     """
     Enum class for the different types of tasks supported by PEFT.
 

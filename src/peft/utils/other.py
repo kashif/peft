@@ -36,7 +36,12 @@ from packaging import version
 from safetensors.torch import storage_ptr, storage_size
 from transformers import PreTrainedModel
 
-from ..import_utils import is_gptqmodel_available, is_torch_tpu_available, is_transformers_ge_v5_1_0
+from ..import_utils import (
+    is_gptqmodel_available,
+    is_torch_tpu_available,
+    is_transformers_ge_v5,
+    is_transformers_ge_v5_1_0,
+)
 from .constants import (
     CONFIG_NAME,
     EMBEDDING_LAYER_NAMES,
@@ -47,8 +52,11 @@ from .constants import (
     TRANSFORMERS_MODELS_TO_BEFT_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_BOFT_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_C3A_TARGET_MODULES_MAPPING,
+    TRANSFORMERS_MODELS_TO_DEFT_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_DELORA_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_FOURIERFT_TARGET_MODULES_MAPPING,
+    TRANSFORMERS_MODELS_TO_FROD_TARGET_MODULES_MAPPING,
+    TRANSFORMERS_MODELS_TO_GLORA_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_GRALORA_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_HRA_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING,
@@ -68,7 +76,9 @@ from .constants import (
     TRANSFORMERS_MODELS_TO_RANDLORA_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_ROAD_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_SHIRA_TARGET_MODULES_MAPPING,
+    TRANSFORMERS_MODELS_TO_SUPERTUNING_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_TINYLORA_TARGET_MODULES_MAPPING,
+    TRANSFORMERS_MODELS_TO_UNILORA_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_VBLORA_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_VERA_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_WAVEFT_TARGET_MODULES_MAPPING,
@@ -94,8 +104,11 @@ __all__ = [
     "TRANSFORMERS_MODELS_TO_BEFT_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_BOFT_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_C3A_TARGET_MODULES_MAPPING",
+    "TRANSFORMERS_MODELS_TO_DEFT_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_DELORA_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_FOURIERFT_TARGET_MODULES_MAPPING",
+    "TRANSFORMERS_MODELS_TO_FROD_TARGET_MODULES_MAPPING",
+    "TRANSFORMERS_MODELS_TO_GLORA_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_GRALORA_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_HRA_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING",
@@ -115,7 +128,9 @@ __all__ = [
     "TRANSFORMERS_MODELS_TO_RANDLORA_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_ROAD_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_SHIRA_TARGET_MODULES_MAPPING",
+    "TRANSFORMERS_MODELS_TO_SUPERTUNING_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_TINYLORA_TARGET_MODULES_MAPPING",
+    "TRANSFORMERS_MODELS_TO_UNILORA_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_VBLORA_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_VERA_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_WAVEFT_TARGET_MODULES_MAPPING",
@@ -140,7 +155,9 @@ def infer_device() -> str:
     return "cpu"
 
 
-def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, gradient_checkpointing_kwargs=None):
+def prepare_model_for_kbit_training(
+    model, use_gradient_checkpointing=True, gradient_checkpointing_kwargs=None, auto_clear_cache=True
+):
     r"""
     Note this method only works for `transformers` models.
 
@@ -158,6 +175,10 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, grad
             Keyword arguments to pass to the gradient checkpointing function, please refer to the documentation of
             `torch.utils.checkpoint.checkpoint` for more details about the arguments that you can pass to that method.
             Note this is only available in the latest transformers versions (> 4.34.1).
+        auto_clear_cache (`bool`, *optional*, defaults to `True`):
+            Whether to empty the accelerator cache after upcasting parameters to fp32. This releases memory held by the
+            caching allocator, which is especially helpful on devices that share host and accelerator memory. Set to
+            `False` to skip this step.
     """
     loaded_in_kbit = getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False)
     is_gptq_quantized = getattr(model, "quantization_method", None) == "gptq"
@@ -186,6 +207,16 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, grad
                 (param.dtype == torch.float16) or (param.dtype == torch.bfloat16)
             ) and param.__class__.__name__ != "Params4bit":
                 param.data = param.data.to(torch.float32)
+
+        # Release CUDA allocator cache after bulk fp16→fp32 casts to reduce
+        # reserved-but-unused memory to free up system memory in devices
+        # that share host and accelerator memory (issue #3265)
+        if auto_clear_cache:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            if is_xpu_available():
+                torch.xpu.empty_cache()
 
     if (
         loaded_in_kbit
@@ -229,7 +260,7 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, grad
 
 
 # copied from transformers.models.bart.modeling_bart
-def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
+def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int) -> torch.Tensor:
     """
     Shift input ids one token to the right.
 
@@ -326,7 +357,11 @@ class AuxiliaryTrainingWrapper(torch.nn.Module):
         if isinstance(self.original_module, BaseTunerLayer):
             # e.g. applying a training wrapper to a lora layer makes no sense
             cls_name = self.original_module.__class__
-            raise TypeError(f"{self._error_message_name()} cannot be applied to modules of type {cls_name}")
+            raise TypeError(
+                f"{self._error_message_name()} cannot be applied to modules of type {cls_name}, as this module is "
+                "already targeted by the PEFT method. Please remove it from either the target modules or from "
+                f"{self._error_message_name()}."
+            )
 
     @property
     def disable_adapters(self) -> bool:
@@ -494,6 +529,25 @@ class AuxiliaryTrainingWrapper(torch.nn.Module):
         """
         raise NotImplementedError
 
+    def set_training(self, adapter_names: str | Sequence[str], training: bool = True) -> None:
+        """
+        Enable or disable training mode on the given adapter modules.
+
+        Args:
+            adapter_names (`str` or `Sequence[str]`):
+                The name of the adapter(s) whose training mode should be updated.
+            training (`bool`, *optional*) :
+                Whether to enable (`True`, default) or disable (`False`) training mode.
+        """
+        if isinstance(adapter_names, str):
+            adapter_names = [adapter_names]
+
+        for adapter_name in adapter_names:
+            for name in self.adapter_layer_names + self.other_param_names:
+                module_dict = attrgetter(name)(self)
+                if isinstance(module_dict, torch.nn.ModuleDict) and adapter_name in module_dict:
+                    module_dict[adapter_name].train(training)
+
     def set_adapter(self, adapter_names: Union[str, list[str]], inference_mode: bool = False) -> None:
         """Set the active adapter
 
@@ -508,6 +562,7 @@ class AuxiliaryTrainingWrapper(torch.nn.Module):
         """
         if isinstance(adapter_names, str):
             self._active_adapter = adapter_names
+            self.set_training(adapter_names, self.training and not inference_mode)
         else:
             self._active_adapter = []
             for adapter_name in adapter_names:
@@ -515,6 +570,7 @@ class AuxiliaryTrainingWrapper(torch.nn.Module):
                     raise ValueError(f"Adapter {adapter_name} not found in {self._adapters}")
 
                 self._active_adapter.append(adapter_name)
+                self.set_training(adapter_name, self.training and not inference_mode)
 
     def delete_adapter(self, adapter_name: str, new_active_adapters: Optional[list[str]]) -> None:
         """Delete an adapter from the layer, set a new active adapter if necessary"""
@@ -525,7 +581,7 @@ class AuxiliaryTrainingWrapper(torch.nn.Module):
         Enable or disable gradients on the given adapter(s).
 
         Args:
-            adapter_name (`str` or `Sequence[str]`):
+            adapter_names (`str` or `Sequence[str]`):
                 The name of the adapter(s) whose gradients should be enabled/disabled.
             requires_grad (`bool`, *optional*)
                 Whether to enable (`True`, default) or disable (`False`).
@@ -705,6 +761,7 @@ class ModulesToSaveWrapper(AuxiliaryTrainingWrapper):
             raise ValueError(f"Adapter {adapter_name} not found in {self._adapters}")
 
         _set_layer_requires_grad(self.modules_to_save[adapter_name], not inference_mode)
+        self.set_training(adapter_name, self.training and not inference_mode)
         self._active_adapter = adapter_name
 
     def delete_adapter(self, adapter_name: str, new_active_adapters: Optional[list[str]]) -> None:
@@ -716,6 +773,14 @@ class ModulesToSaveWrapper(AuxiliaryTrainingWrapper):
         layers.
         """
         if adapter_name not in self.modules_to_save:
+            # The deleted adapter never managed this module, but the fallback adapter might: sync it to
+            # active, mirroring the path below. Otherwise the fallback's copy stays frozen while active.
+            if new_active_adapters:
+                new_active_adapter = new_active_adapters[0]
+                if new_active_adapter in self.modules_to_save and (
+                    not self.active_adapters or new_active_adapter != self.active_adapters[0]
+                ):
+                    self.set_adapter(new_active_adapter)
             return
 
         # set new active adapter, if necessary
@@ -761,26 +826,55 @@ class ModulesToSaveWrapper(AuxiliaryTrainingWrapper):
             # ModulesToSaveWrapper will be queried but not every wrapper is obliged to serve the same adapters.
             return {}
 
-        return {
-            k: state_dict[f"modules_to_save.{adapter_name}.{k}"]
-            for k in self.modules_to_save[adapter_name].state_dict()
-        }
+        module = self.modules_to_save[adapter_name]
+        # remove_duplicate=False: a buffer registered under two names (aliased to the same tensor) should still
+        # be recognized under both, not just whichever one named_buffers() happens to report by default.
+        buffer_names = {name for name, _ in module.named_buffers(remove_duplicate=False)}
+        adapter_state_dict = {}
+        for k in module.state_dict():
+            key = f"modules_to_save.{adapter_name}.{k}"
+            if key in state_dict:
+                adapter_state_dict[k] = state_dict[key]
+            elif k in buffer_names:
+                # See #3805: the passed state_dict may contain only parameters, e.g. when it was built from
+                # gathered FSDP2 DTensors via named_parameters(). Buffers are not sharded by FSDP or DeepSpeed,
+                # so the local copy already holds the full value, and falling back to it here is correct.
+                # Skipping the buffer instead would leave the key out of the checkpoint, which
+                # set_peft_model_state_dict requires to be present for every key of the load map, so loading
+                # would fail later with a less clear error.
+                adapter_state_dict[k] = module.get_buffer(k)
+            else:
+                raise KeyError(
+                    f"Expected key '{key}' of modules_to_save adapter '{adapter_name}' in the passed state_dict, but "
+                    "it is missing. The state_dict must contain all parameters of the modules_to_save module."
+                )
+        return adapter_state_dict
 
     def unload_and_optionally_merge_module(
         self, merge: bool, safe_merge: bool, adapter_names: Optional[list[str]]
     ) -> torch.nn.Module:
-        """Unloading in case of `ModulesToSave` means to simply return the wrapped module.
+        """Return the module that replaces this wrapper when unloading the PEFT model.
 
-        However, if the wrapped module is itself a tuner, we'll call merge on it before.
+        When merging, this is the modules_to_save copy of the active adapter, so that the trained weights are kept. If
+        that copy is itself a tuner layer, it is merged first. Without merging, or if no adapter is active on this
+        wrapper, the original module is returned, i.e. the base model is restored.
         """
+        if not self.active_adapters:
+            # none of the modules_to_save adapters of this module are active, e.g. because the model's active adapter
+            # does not use modules_to_save on this module; like in forward, the original module is used in this case
+            return self.original_module
+
+        if not merge:
+            # without merging, unloading should give back the base model, so the original module is returned instead
+            # of the trained modules_to_save copy
+            return self.original_module
+
         new_module = self.modules_to_save[self.active_adapter]
 
         # TODO: not sure if this is still a sensible thing to do. We would basically have to
         # do the same checks as `_unload_and_optionally_merge` to support MHA, for example.
         if hasattr(new_module, "base_layer"):
-            # check if the module is itself a tuner layer
-            if merge:
-                new_module.merge(safe_merge=safe_merge, adapter_names=adapter_names)
+            new_module.merge(safe_merge=safe_merge, adapter_names=adapter_names)
             new_module = new_module.get_base_layer()
 
         return new_module
@@ -868,20 +962,33 @@ class TrainableTokensWrapper(AuxiliaryTrainingWrapper):
         super().update(active_adapter)
 
     def adapter_state_dict_load_map(self, adapter_name):
+        if adapter_name not in self._adapters:
+            return {}
         if self.token_adapter.tied_adapter:
             return {}
         return {"token_adapter.trainable_tokens_delta": f"token_adapter.trainable_tokens_delta.{adapter_name}"}
 
     def adapter_state_dict(self, adapter_name, state_dict):
+        if adapter_name not in self._adapters:
+            return {}
+
         if self.token_adapter.tied_adapter:
             # storing of weight-tied layers is not up to us and will be handled by
             # transformers. we're just here to keep those layers in sync during training.
             # therefore we return an empty state dict.
             return {}
 
-        return {
-            f"token_adapter.{k}": state_dict[f"token_adapter.{k}.{adapter_name}"] for k in ["trainable_tokens_delta"]
-        }
+        key = f"token_adapter.trainable_tokens_delta.{adapter_name}"
+        if key not in state_dict:
+            # See #3805, which added the equivalent fallback for ModulesToSaveWrapper's buffers above. There is
+            # no equivalent fallback here on purpose: trainable_tokens_delta is a parameter, not a buffer, and
+            # parameters (unlike buffers) can be sharded, e.g. with DeepSpeed ZeRO-3, so the local copy on this
+            # rank is not guaranteed to hold the full value the way a buffer's local copy is.
+            raise KeyError(
+                f"Expected key '{key}' of trainable tokens adapter '{adapter_name}' in the passed state_dict, but it "
+                "is missing. The state_dict must contain the full (gathered) trainable tokens parameters."
+            )
+        return {"token_adapter.trainable_tokens_delta": state_dict[key]}
 
     def enable_adapters(self, enabled: bool):
         """Enables/disables the underlying `TrainableTokens` adapter.
@@ -969,7 +1076,7 @@ class TrainableTokensWrapper(AuxiliaryTrainingWrapper):
         return set(self.token_adapter.trainable_tokens_delta.keys())
 
 
-def _get_input_embeddings_name(model, default=None):
+def _get_input_embeddings_name(model: torch.nn.Module, default: Optional[str] = None) -> Optional[str]:
     if not hasattr(model, "get_input_embeddings"):
         return default
 
@@ -981,14 +1088,16 @@ def _get_input_embeddings_name(model, default=None):
     return default
 
 
-def _get_submodules(model, key):
+def _get_submodules(model: torch.nn.Module, key: str) -> tuple[torch.nn.Module, torch.nn.Module, str]:
     parent = model.get_submodule(".".join(key.split(".")[:-1]))
     target_name = key.split(".")[-1]
     target = model.get_submodule(key)
     return parent, target, target_name
 
 
-def _get_submodules_with_grandparent(model, key):
+def _get_submodules_with_grandparent(
+    model: torch.nn.Module, key: str
+) -> tuple[torch.nn.Module, Optional[torch.nn.Module], torch.nn.Module, str]:
     parent = model.get_submodule(".".join(key.split(".")[:-1]))
     try:
         grandparent = model.get_submodule(".".join(key.split(".")[:-2]))
@@ -1000,7 +1109,7 @@ def _get_submodules_with_grandparent(model, key):
     return parent, grandparent, target, target_name
 
 
-def _freeze_adapter(model, adapter_name):
+def _freeze_adapter(model: torch.nn.Module, adapter_name: str) -> None:
     for n, p in model.named_parameters():
         if adapter_name in n:
             p.requires_grad = False
@@ -1047,7 +1156,7 @@ def _set_trainable(
     key_list = [key for key, _ in model.named_modules(remove_duplicate=False)]
 
     for key in key_list:
-        target_module_found = any(key.endswith(target_key) for target_key in module_names)
+        target_module_found = any(_is_valid_match(key, target_key) for target_key in module_names)
         if target_module_found:
             parent, grandparent, target, target_name = _get_submodules_with_grandparent(model, key)
             if isinstance(grandparent, BaseTunerLayer):
@@ -1073,11 +1182,14 @@ def _set_trainable(
             if isinstance(grandparent, wrapper_cls):
                 grandparent.update(adapter_name, **wrapper_kwargs)
                 grandparent.set_adapter(grandparent.active_adapter, inference_mode=inference_mode)
+                grandparent.set_training(adapter_name, grandparent.training and not inference_mode)
             elif isinstance(target, wrapper_cls):
                 target.update(adapter_name, **wrapper_kwargs)
                 target.set_adapter(target.active_adapter, inference_mode=inference_mode)
+                target.set_training(adapter_name, target.training and not inference_mode)
             else:
                 new_module = wrapper_cls(target, adapter_name, **wrapper_kwargs)
+                new_module.train(target.training)
                 if activate_adapter:
                     new_module.set_adapter(adapter_name, inference_mode=inference_mode)
                 else:
@@ -1114,9 +1226,6 @@ def _prepare_prompt_learning_config(peft_config, model_config):
     orig_model_config = model_config
     if hasattr(model_config, "to_dict"):
         model_config = model_config.to_dict()
-    else:
-        model_config = model_config
-
     # In case of VLM we focus on the language model portion of the model.
     if "text_config" in model_config:
         model_config = model_config["text_config"]
@@ -1161,13 +1270,32 @@ def _prepare_prompt_learning_config(peft_config, model_config):
 
     # For grouped-query attention, see #1901.
     if (peft_config.peft_type in {"PREFIX_TUNING", "CARTRIDGE"}) and ("num_key_value_heads" in model_config):
-        # Models with heterogeneous attention (e.g. Gemma4) expose distinct shapes for global vs. sliding layers via
-        # `global_head_dim` / `num_global_key_value_heads`. Provision the prefix for the global-layer footprint; sliding
-        # layers whose KV shape doesn't match are skipped per-layer at injection time. Matches the default in
-        # google-deepmind/gemma#631.
+        # Models with heterogeneous attention (e.g. Gemma4) expose distinct shapes for global vs. sliding layers.
+        # New transformers (>= 5.15) use `per_layer_config` instead of `global_head_dim` / `num_global_key_value_heads`.
+        # Provision the prefix for the largest KV footprint; sliding layers whose KV shape doesn't match are skipped
+        # per-layer at injection time. Matches the default in google-deepmind/gemma#631.
         if model_config.get("global_head_dim") is not None:
             head_dim = model_config["global_head_dim"]
             num_key_value_heads = model_config.get("num_global_key_value_heads") or model_config["num_key_value_heads"]
+        elif model_config.get("per_layer_config") is not None:
+            # New transformers (>= 5.15): global_head_dim / num_global_key_value_heads were replaced by
+            # per_layer_config. Here model_config is a plain dict (from config.to_dict()), so
+            # per_layer_config contains only the *overrides*; the base head_dim and num_key_value_heads
+            # come from the top-level config. (The per_layer_config property on the config object
+            # returns the full config with overrides applied, but that's not available here.)
+            # Resolve the effective per-layer values and provision the prefix for the largest KV
+            # footprint (typically the full-attention layers).
+            per_layer = model_config["per_layer_config"]
+            base_head_dim = model_config.get("head_dim", peft_config.token_dim // peft_config.num_attention_heads)
+            base_num_kv_heads = model_config["num_key_value_heads"]
+            head_dim = base_head_dim
+            num_key_value_heads = base_num_kv_heads
+            for layer_cfg in per_layer.values():
+                layer_head_dim = layer_cfg.get("head_dim", base_head_dim)
+                layer_num_kv = layer_cfg.get("num_key_value_heads", base_num_kv_heads)
+                if layer_head_dim > head_dim:
+                    head_dim = layer_head_dim
+                    num_key_value_heads = layer_num_kv
         elif model_config.get("head_dim", None) is not None:
             head_dim = model_config["head_dim"]
             num_key_value_heads = model_config["num_key_value_heads"]
@@ -1233,18 +1361,16 @@ def fsdp_auto_wrap_policy(model):
             continue
         transformer_cls = get_module_class_from_name(model, layer_class)
         if transformer_cls is None:
-            raise Exception("Could not find the transformer layer class to wrap in the model.")
+            raise TypeError("Could not find the transformer layer class to wrap in the model.")
         else:
             transformer_cls_to_wrap.add(transformer_cls)
 
     def lambda_policy_fn(module):
-        if (
+        return (
             len(list(module.named_children())) == 0
             and getattr(module, "weight", None) is not None
             and module.weight.requires_grad
-        ):
-            return True
-        return False
+        )
 
     lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
     transformer_wrap_policy = functools.partial(
@@ -1256,7 +1382,7 @@ def fsdp_auto_wrap_policy(model):
     return auto_wrap_policy
 
 
-def transpose(weight, fan_in_fan_out):
+def transpose(weight: torch.Tensor, fan_in_fan_out: bool) -> torch.Tensor:
     if not fan_in_fan_out:
         return weight
 
@@ -1265,7 +1391,7 @@ def transpose(weight, fan_in_fan_out):
     return weight.T
 
 
-def _is_valid_match(key: str, target_key: str):
+def _is_valid_match(key: str, target_key: str) -> bool:
     """
     Helper function to match module names target_key and key. Makes sure that either the key is exactly the target_key
     or the target_key is a submodule of key
@@ -1398,7 +1524,7 @@ def id_tensor_storage(tensor: torch.Tensor) -> tuple[torch.device, int, int]:
     return tensor.device, unique_id, storage_size(tensor)
 
 
-def cast_mixed_precision_params(model, dtype):
+def cast_mixed_precision_params(model: torch.nn.Module, dtype: torch.dtype) -> None:
     """
     Cast all non-trainable parameters of the model to the given `dtype`. The `dtype` can be `torch.float16` or
     `torch.bfloat16` as per the mixed-precision training you are performing. The trainable parameters are cast to full
@@ -1461,7 +1587,7 @@ def check_file_exists_on_hf_hub(repo_id: str, filename: str, **kwargs) -> Option
     return exists
 
 
-def match_target_against_key(target_pattern: str, key: str):
+def match_target_against_key(target_pattern: str, key: str) -> Optional[re.Match[str]]:
     """Backing function for `target_modules` config parameter.
 
     Having this as its own function ensures that target key matching can be implemented in the same way everywhere.
@@ -1647,6 +1773,9 @@ def create_attention_mask(
     # the 4D causal mask exists, it should be present in the base model (XXXModel class) or in its decoder.
     base_model = getattr(model, model.base_model_prefix, model)
     decoder = base_model.get_decoder() if hasattr(base_model, "get_decoder") else None
+    # TODO: remove check for _prepare_4d_causal_attention_mask_with_cache_position once Transformers <= v5.2 is
+    # dropped. Note that for <= v5.2, the function may or may not exist, so the fallback in the
+    # `causal_mask_creation_function is None` case is still needed.
     causal_mask_creation_function = getattr(base_model, "_prepare_4d_causal_attention_mask_with_cache_position", None)
     if causal_mask_creation_function is None and decoder is not None:  # it may be in the decoder
         causal_mask_creation_function = getattr(decoder, "_prepare_4d_causal_attention_mask_with_cache_position", None)
@@ -1656,16 +1785,29 @@ def create_attention_mask(
         token_type_ids = getattr(model_input, "token_type_ids", None)
         # Some models may overwrite the general one
         causal_mask_creation_function = getattr(model, "create_masks_for_generate", create_masks_for_generate)
-        attention_mask = causal_mask_creation_function(
-            config=model.config,
-            # we only need batch size, seq_length and dtype here - we don't care about the values of the embeddings
-            input_embeds=torch.empty((batch_size, sequence_length), dtype=model.dtype),
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-        )
+        # Transforrmers only uses batch size, seq_length, and dtype of inputs_embeds to create the mask, so it's safe to
+        # create a dummy tensor here.
+        dummy_embeds = torch.empty((batch_size, sequence_length), dtype=model.dtype)
+        if is_transformers_ge_v5:
+            # transformers v5 renamed the input_embeds argument to inputs_embeds and removed cache_position
+            attention_mask = causal_mask_creation_function(
+                config=model.config,
+                inputs_embeds=dummy_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+            )
+        else:
+            attention_mask = causal_mask_creation_function(
+                config=model.config,
+                input_embeds=dummy_embeds,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                past_key_values=past_key_values,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+            )
     else:
         attention_mask = causal_mask_creation_function(
             attention_mask,
@@ -1713,7 +1855,7 @@ def _get_module_names_tied_with_embedding(model) -> list[str]:
     if (
         model_config is not None
         and hasattr(model_config, "tie_word_embeddings")
-        and getattr(model_config, "tie_word_embeddings") is False
+        and model_config.tie_word_embeddings is False
     ):
         return []
 

@@ -4,16 +4,18 @@ on:
   pull_request:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 permissions: {}
 
 jobs:
   build:
-    uses: huggingface/doc-builder/.github/workflows/build_pr_documentation.yml@899185857f31747d2e8a3b5c6139920971997bd8  # main
+    permissions:
+      contents: read
+    uses: huggingface/doc-builder/.github/workflows/build_pr_documentation.yml@bc117cfbd874cbf27a80882e4676f4d06f2bb394  # main
     with:
       commit_sha: ${{ github.event.pull_request.head.sha }}
       pr_number: ${{ github.event.number }}
       package: peft
-      custom_container: huggingface/transformers-doc-builder
+      python_version: "3.14"

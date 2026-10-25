@@ -109,7 +109,7 @@ class TestXlora:
 
     @pytest.fixture(scope="class")
     def tokenizer(self):
-        tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True, device_map=self.torch_device)
+        tokenizer = AutoTokenizer.from_pretrained(self.model_id, device_map=self.torch_device)
         return tokenizer
 
     @pytest.fixture(scope="function")
@@ -191,7 +191,7 @@ class TestXlora:
         assert torch.isfinite(outputs[: inputs.shape[1] :]).all()
 
         _ = model.get_latest_scalings()
-        # 32 is the numeber of max scalings. 3 is the number of prompt tokens.
+        # 32 is the number of max scalings. 3 is the number of prompt tokens.
         assert 32 + 3 >= len(model.get_scalings_log()) > 0
 
         model.disable_scalings_logging()
@@ -349,6 +349,92 @@ class TestXlora:
         assert torch.isfinite(outputs[: inputs.shape[1] :]).all()
         assert not torch.equal(outputs, outputs_disabled)
 
+    def test_disable_adapter_matches_base_model(self, tokenizer, model):
+        # The X-LoRA layers replace the forward method of the LoRA layers and used to ignore the disabled state of the
+        # X-LoRA adapter. Inside a disable_adapter context, no scalings are computed, so all experts were applied at
+        # full strength instead of not being applied at all.
+        inputs = tokenizer.encode("Python is a", add_special_tokens=False, return_tensors="pt").to(self.torch_device)
+
+        with hub_online_once(self.model_id):
+            base_model = AutoModelForCausalLM.from_pretrained(self.model_id).to(self.torch_device)
+        base_model.config.use_cache = False
+        base_model.eval()
+        model.eval()
+
+        with torch.no_grad():
+            expected = base_model(input_ids=inputs).logits
+            with model.disable_adapter():
+                outputs_disabled = model(input_ids=inputs).logits
+            outputs = model(input_ids=inputs).logits
+
+        assert torch.allclose(outputs_disabled, expected, atol=1e-5, rtol=1e-5)
+        # sanity check: with the adapter enabled, the output differs from the base model
+        assert not torch.allclose(outputs, expected, atol=1e-5, rtol=1e-5)
+
+    def test_disable_adapter_matches_base_model_embedding(self, tokenizer, embedding_model):
+        # same as test_disable_adapter_matches_base_model but for XLoraEmbeddingLayer
+        inputs = tokenizer.encode("Python is a", add_special_tokens=False, return_tensors="pt").to(self.torch_device)
+
+        with hub_online_once(self.model_id):
+            base_model = AutoModelForCausalLM.from_pretrained(self.model_id).to(self.torch_device)
+        base_model.config.use_cache = False
+        base_model.eval()
+        embedding_model.eval()
+
+        with torch.no_grad():
+            expected = base_model(input_ids=inputs).logits
+            with embedding_model.disable_adapter():
+                outputs_disabled = embedding_model(input_ids=inputs).logits
+            outputs = embedding_model(input_ids=inputs).logits
+
+        assert torch.allclose(outputs_disabled, expected, atol=1e-5, rtol=1e-5)
+        assert not torch.allclose(outputs, expected, atol=1e-5, rtol=1e-5)
+
+    @pytest.mark.parametrize("training", [True, False])
+    def test_generate_preserves_training_mode(self, tokenizer, model, training):
+        # generate used to put the whole model into eval mode as a side effect, which silently disables dropout for
+        # the rest of the training run. Whichever mode the user set must survive the call.
+        inputs = tokenizer.encode("Python is a", add_special_tokens=False, return_tensors="pt")
+        model.train(training)
+
+        model.generate(input_ids=inputs.to(self.torch_device), max_new_tokens=4)
+
+        assert model.base_model.training is training
+        assert model.base_model.lora_model.model.training is training
+
+    def test_classifier_stays_trainable_after_generate(self, tokenizer, model):
+        # With use_trainable_adapters=False (the default of the `model` fixture), the X-LoRA classifier is the only
+        # trainable part of the model and everything else, experts included, is frozen. The classifier parameters are
+        # called "internal_xlora_classifier.*", which contains the "lora_" substring that was used to identify the
+        # experts to freeze, so calling generate froze the classifier and made further training a silent no-op.
+        classifier_params = [param for name, param in model.named_parameters() if "internal_xlora_classifier" in name]
+        other_params = [param for name, param in model.named_parameters() if "internal_xlora_classifier" not in name]
+        assert classifier_params
+        assert other_params
+        assert all(param.requires_grad for param in classifier_params)
+        assert not any(param.requires_grad for param in other_params)
+
+        inputs = tokenizer.encode("Python is a", add_special_tokens=False, return_tensors="pt")
+        model.generate(input_ids=inputs.to(self.torch_device), max_new_tokens=4)
+
+        # the classifier is still trainable and nothing else became trainable
+        assert all(param.requires_grad for param in classifier_params)
+        assert not any(param.requires_grad for param in other_params)
+
+    def test_experts_stay_frozen_after_forward(self, tokenizer, model):
+        # With use_trainable_adapters=False (the default of the `model` fixture), the LoRA experts must never require
+        # grads, no matter how many forward passes were run. The scalings pass disables and then re-enables the LoRA
+        # layers on every forward, and re-enabling them goes through `set_adapter`, which marks them as trainable
+        # again; the experts were only frozen again after `generate`, so a plain forward left all of them trainable.
+        expert_params = [param for name, param in model.named_parameters() if ".lora_A." in name or ".lora_B." in name]
+        assert expert_params
+        assert not any(param.requires_grad for param in expert_params)
+
+        inputs = tokenizer.encode("Python is a", add_special_tokens=False, return_tensors="pt")
+        model(input_ids=inputs.to(self.torch_device))
+
+        assert not any(param.requires_grad for param in expert_params)
+
     def test_functional_embedding(self, tokenizer, embedding_model):
         inputs = tokenizer.encode("Python is a", add_special_tokens=False, return_tensors="pt")
         outputs = embedding_model.generate(
@@ -358,7 +444,7 @@ class TestXlora:
         assert torch.isfinite(outputs[: inputs.shape[1] :]).all()
 
     def test_xlora_loading_valid(self):
-        # This test also simulatenously tests the loading-from-hub functionality!
+        # This test also simultaneously tests the loading-from-hub functionality!
         torch.manual_seed(123)
 
         model_id = "peft-internal-testing/opt-125m"

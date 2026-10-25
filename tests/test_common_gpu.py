@@ -57,10 +57,13 @@ from peft import (
 )
 from peft.import_utils import is_bnb_4bit_available, is_bnb_available, is_xpu_available
 from peft.tuners.lora.config import LoraRuntimeConfig
+from peft.tuners.tuners_utils import BaseTunerLayer
 from peft.utils import infer_device
 
 from .testing_utils import (
+    DEVICE_MAP_MAP,
     device_count,
+    hub_online_once,
     load_cat_image,
     require_bitsandbytes,
     require_deterministic_for_xpu,
@@ -77,14 +80,12 @@ if is_bnb_available():
     from peft.tuners.lora import Linear8bitLt as LoraLinear8bitLt
     from peft.tuners.randlora import Linear8bitLt as RandLoraLinear8bitLt
     from peft.tuners.road import Linear8bitLt as RoadLinear8bitLt
-    from peft.tuners.vera import Linear8bitLt as VeraLinear8bitLt
 
     if is_bnb_4bit_available():
         from peft.tuners.ia3 import Linear4bit as IA3Linear4bit
         from peft.tuners.lora import Linear4bit as LoraLinear4bit
         from peft.tuners.randlora import Linear4bit as RandLoraLinear4bit
         from peft.tuners.road import Linear4bit as RoadLinear4bit
-        from peft.tuners.vera import Linear4bit as VeraLinear4bit
 
 
 @require_non_cpu
@@ -196,13 +197,16 @@ class PeftGPUCommonTests(unittest.TestCase):
         config = VeraConfig(r=32, target_modules=["q_proj", "v_proj"], vera_dropout=0.05, bias="none")
 
         flan_8bit = get_peft_model(flan_8bit, flan_vera_config)
-        assert isinstance(flan_8bit.base_model.model.encoder.block[0].layer[0].SelfAttention.q, VeraLinear8bitLt)
+        quant_layers = [m for m in flan_8bit.modules() if getattr(m, "quantization_backend", None) is not None]
+        assert len(quant_layers) > 0
 
         opt_8bit = get_peft_model(opt_8bit, opt_vera_config)
-        assert isinstance(opt_8bit.base_model.model.model.decoder.layers[0].self_attn.v_proj, VeraLinear8bitLt)
+        quant_layers = [m for m in opt_8bit.modules() if getattr(m, "quantization_backend", None) is not None]
+        assert len(quant_layers) > 0
 
         whisper_8bit = get_peft_model(whisper_8bit, config)
-        assert isinstance(whisper_8bit.base_model.model.model.decoder.layers[0].self_attn.v_proj, VeraLinear8bitLt)
+        quant_layers = [m for m in whisper_8bit.modules() if getattr(m, "quantization_backend", None) is not None]
+        assert len(quant_layers) > 0
 
     @require_bitsandbytes
     @pytest.mark.multi_gpu_tests
@@ -358,12 +362,12 @@ class PeftGPUCommonTests(unittest.TestCase):
         model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
         model = PeftModel.from_pretrained(model, peft_model_id)
 
-        model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+        model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(model.device))
 
         # loading a 2nd adapter works, #1239
         model.load_adapter(peft_model_id, "adapter2")
         model.set_adapter("adapter2")
-        model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+        model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(model.device))
 
         # check that both adapters are in the same layer
         assert "default" in model.base_model.model.model.decoder.layers[0].self_attn.q_proj.lora_A
@@ -388,19 +392,19 @@ class PeftGPUCommonTests(unittest.TestCase):
         config = AdaLoraConfig(task_type=TaskType.CAUSAL_LM, total_step=1)
         peft_model = get_peft_model(model, config)
         peft_model = prepare_model_for_kbit_training(peft_model)
-        peft_model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+        peft_model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(peft_model.device))
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             peft_model.save_pretrained(tmp_dir)
             model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
             model = PeftModel.from_pretrained(model, tmp_dir)
             model = prepare_model_for_kbit_training(peft_model)
-            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(model.device))
 
             # loading a 2nd adapter works, #1239
             model.load_adapter(tmp_dir, "adapter2")
             model.set_adapter("adapter2")
-            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(model.device))
 
             # check that both adapters are in the same layer
             assert "default" in model.base_model.model.model.decoder.layers[0].self_attn.q_proj.lora_A
@@ -425,19 +429,19 @@ class PeftGPUCommonTests(unittest.TestCase):
         config = VeraConfig(task_type=TaskType.CAUSAL_LM)
         peft_model = get_peft_model(model, config)
         peft_model = prepare_model_for_kbit_training(peft_model)
-        peft_model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+        peft_model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(peft_model.device))
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             peft_model.save_pretrained(tmp_dir)
             model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
             model = PeftModel.from_pretrained(model, tmp_dir)
             model = prepare_model_for_kbit_training(model)
-            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(model.device))
 
             # loading a 2nd adapter works, #1239
             model.load_adapter(tmp_dir, "adapter2")
             model.set_adapter("adapter2")
-            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(model.device))
 
             # check that both adapters are in the same layer
             assert "default" in model.base_model.model.model.decoder.layers[0].self_attn.q_proj.vera_A
@@ -462,19 +466,19 @@ class PeftGPUCommonTests(unittest.TestCase):
         config = RandLoraConfig(task_type=TaskType.CAUSAL_LM)
         peft_model = get_peft_model(model, config)
         peft_model = prepare_model_for_kbit_training(peft_model)
-        peft_model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+        peft_model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(peft_model.device))
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             peft_model.save_pretrained(tmp_dir)
             model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
             model = PeftModel.from_pretrained(model, tmp_dir)
             model = prepare_model_for_kbit_training(model)
-            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(model.device))
 
             # loading a 2nd adapter works, #1239
             model.load_adapter(tmp_dir, "adapter2")
             model.set_adapter("adapter2")
-            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(model.device))
 
             # check that both adapters are in the same layer
             assert "default" in model.base_model.model.model.decoder.layers[0].self_attn.q_proj.randlora_A
@@ -499,19 +503,19 @@ class PeftGPUCommonTests(unittest.TestCase):
         config = IA3Config(task_type=TaskType.CAUSAL_LM)
         peft_model = get_peft_model(model, config)
         peft_model = prepare_model_for_kbit_training(peft_model)
-        peft_model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+        peft_model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(peft_model.device))
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             peft_model.save_pretrained(tmp_dir)
             model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
             model = PeftModel.from_pretrained(model, tmp_dir)
             model = prepare_model_for_kbit_training(model)
-            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(model.device))
 
             # loading a 2nd adapter works, #1239
             model.load_adapter(tmp_dir, "adapter2")
             model.set_adapter("adapter2")
-            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(0))
+            model.generate(input_ids=torch.LongTensor([[0, 2, 3, 1]]).to(model.device))
 
             # check that both adapters are in the same layer
             assert "default" in model.base_model.model.model.decoder.layers[0].self_attn.q_proj.ia3_l
@@ -650,13 +654,16 @@ class PeftGPUCommonTests(unittest.TestCase):
         config = VeraConfig(r=32, target_modules=["q_proj", "v_proj"], vera_dropout=0.05, bias="none")
 
         flan_4bit = get_peft_model(flan_4bit, flan_vera_config)
-        assert isinstance(flan_4bit.base_model.model.encoder.block[0].layer[0].SelfAttention.q, VeraLinear4bit)
+        quant_layers = [m for m in flan_4bit.modules() if getattr(m, "quantization_backend", None) is not None]
+        assert len(quant_layers) > 0
 
         opt_4bit = get_peft_model(opt_4bit, opt_vera_config)
-        assert isinstance(opt_4bit.base_model.model.model.decoder.layers[0].self_attn.v_proj, VeraLinear4bit)
+        quant_layers = [m for m in opt_4bit.modules() if getattr(m, "quantization_backend", None) is not None]
+        assert len(quant_layers) > 0
 
         whisper_4bit = get_peft_model(whisper_4bit, config)
-        assert isinstance(whisper_4bit.base_model.model.model.decoder.layers[0].self_attn.v_proj, VeraLinear4bit)
+        quant_layers = [m for m in whisper_4bit.modules() if getattr(m, "quantization_backend", None) is not None]
+        assert len(quant_layers) > 0
 
     @require_bitsandbytes
     @pytest.mark.multi_gpu_tests
@@ -834,11 +841,13 @@ class PeftGPUCommonTests(unittest.TestCase):
         )
 
         model = AutoModelForSeq2SeqLM.from_pretrained(
-            self.seq2seq_model_id, device_map="balanced", quantization_config=BitsAndBytesConfig(load_in_8bit=True)
+            self.seq2seq_model_id,
+            device_map=DEVICE_MAP_MAP[self.seq2seq_model_id],
+            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
         )
         tokenizer = AutoTokenizer.from_pretrained(self.seq2seq_model_id)
 
-        assert set(model.hf_device_map.values()) == set(range(device_count))
+        assert set(model.hf_device_map.values()) == set(DEVICE_MAP_MAP[self.seq2seq_model_id].values())
 
         model = get_peft_model(model, lora_config)
         assert isinstance(model, PeftModel)
@@ -1762,7 +1771,7 @@ class PeftGPUCommonTests(unittest.TestCase):
     @require_non_cpu
     @pytest.mark.single_gpu_tests
     def test_r_odd_hra_inference(self):
-        # check that an untrained HRA adapter can't be initialized as an identity tranformation
+        # check that an untrained HRA adapter can't be initialized as an identity transformation
         # when r is an odd number
         model = AutoModelForCausalLM.from_pretrained(
             "peft-internal-testing/opt-125m",
@@ -1779,6 +1788,72 @@ class PeftGPUCommonTests(unittest.TestCase):
         logits_hra = model(random_input).logits
 
         assert not torch.allclose(logits, logits_hra)
+
+
+@require_non_cpu
+@require_bitsandbytes
+@pytest.mark.single_gpu_tests
+class TestBnbMergeBias:
+    """Merging adapters that change the bias of a bitsandbytes quantized layer"""
+
+    model_id = "peft-internal-testing/opt-125m"
+
+    @pytest.fixture(autouse=True)
+    def cleanup(self):
+        yield
+        clear_device_cache(garbage_collection=True)
+
+    def get_model(self, quantization, config):
+        if quantization == "4bit":
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=False,
+                bnb_4bit_compute_dtype=torch.float32,
+            )
+        else:
+            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+
+        with hub_online_once(self.model_id):
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_id, quantization_config=quantization_config, dtype=torch.float32
+            )
+        return get_peft_model(model, config)
+
+    @staticmethod
+    def get_first_tuner_layer(model):
+        # the first layer that merge_adapter visits
+        return next(module for module in model.modules() if isinstance(module, BaseTunerLayer))
+
+    @pytest.mark.parametrize("quantization", ["8bit", "4bit"])
+    @pytest.mark.parametrize("method", ["lora", "road"])
+    def test_safe_merge_non_finite_bias_leaves_base_layer_unchanged(self, method, quantization):
+        # a safe merge that fails on the bias must not have replaced the quantized weight already
+        torch.manual_seed(0)
+        if method == "lora":
+            model = self.get_model(quantization, LoraConfig(init_lora_weights=False, lora_bias=True))
+            layer = self.get_first_tuner_layer(model)
+            bias_to_poison = layer.lora_B["default"].bias
+        else:
+            model = self.get_model(quantization, RoadConfig(init_weights=False))
+            layer = self.get_first_tuner_layer(model)
+            # RoAd has no bias of its own, it rotates the bias of the base layer
+            bias_to_poison = layer.get_base_layer().bias
+        with torch.no_grad():
+            bias_to_poison[0] = float("inf")
+
+        base_layer = layer.get_base_layer()
+        base_layer_cls = bnb.nn.Linear4bit if quantization == "4bit" else bnb.nn.Linear8bitLt
+        assert isinstance(base_layer, base_layer_cls)
+        orig_weight = base_layer.weight
+        orig_bias = base_layer.bias.detach().clone()
+
+        with pytest.raises(ValueError, match="NaNs detected"):
+            model.merge_adapter(safe_merge=True)
+
+        # a bnb merge replaces the weight with a newly quantized parameter, so identity shows it was not replaced
+        assert base_layer.weight is orig_weight
+        assert torch.equal(base_layer.bias, orig_bias)
+        assert not layer.merged
 
 
 @pytest.mark.skipif(not (torch.cuda.is_available() or is_xpu_available()), reason="test requires a GPU or XPU")
@@ -2004,7 +2079,6 @@ class TestSameAdapterDifferentDevices:
         assert model.lin0.base_layer.weight.device.type == self.device
         assert model.lin0.ia3_l.other.device.type == self.device
 
-    @pytest.mark.xfail(reason="LN Tuning handling of multiple adapters may not be correct", strict=True)
     def test_ln_tuning_add_new_adapter_does_not_change_device(self, mlp):
         # same as first test, but using LN tuning
         config = LNTuningConfig(target_modules=["lin0"])
@@ -2190,3 +2264,47 @@ class TestSameAdapterDifferentDevices:
         # the rest should be on GPU
         assert model.lin0.base_layer.weight.device.type == self.device
         assert model.lin0.road_theta.other.device.type == self.device
+
+
+class TestPrepareModelForKbitTraining:
+    """Tests for prepare_model_for_kbit_training that require a GPU (issue #3265 memory fix).
+
+    CPU-only tests for this function live in test_other.py.
+    """
+
+    def _make_fp16_model(self):
+        model = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.Linear(64, 64),
+            nn.Linear(64, 32),
+        ).to(torch.float16)
+        model.is_loaded_in_8bit = True
+        return model
+
+    # Keep this skip limited to CUDA/XPU because prepare_model_for_kbit_training only clears those caches today.
+    @pytest.mark.skipif(not (torch.cuda.is_available() or is_xpu_available()), reason="test requires a GPU or XPU")
+    def test_prepare_model_for_kbit_training_no_memory_leak(self):
+        """CUDA/XPU: empty_cache() after bulk fp16→fp32 casts keeps reserved memory under 200 MB (issue #3265)."""
+        device = torch.accelerator.current_accelerator().type
+        model = self._make_fp16_model().to(device)
+
+        torch.accelerator.synchronize()
+        torch.accelerator.reset_peak_memory_stats()
+        mem_before = torch.accelerator.memory_reserved()
+
+        prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+
+        torch.accelerator.synchronize()
+        mem_after = torch.accelerator.memory_reserved()
+
+        delta_mb = (mem_after - mem_before) / (1024**2)
+        assert delta_mb < 200, (
+            f"{device.upper()} reserved memory grew by {delta_mb:.1f} MB after prepare_model_for_kbit_training"
+        )
+
+        # Confirm empty_cache() was actually called: a second call should not further reduce reserved memory.
+        torch.accelerator.empty_cache()
+        mem_after_extra_empty = torch.accelerator.memory_reserved()
+        assert mem_after == mem_after_extra_empty, (
+            "Reserved memory changed after a second empty_cache(), meaning the first call was not made"
+        )

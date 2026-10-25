@@ -48,6 +48,7 @@ class AdamssLayer(BaseTunerLayer):
         "exp_avg_ipt_B",
         "exp_avg_unc_A",
         "exp_avg_unc_B",
+        "adamss_newB",
     )
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
@@ -175,7 +176,7 @@ class AdamssLayer(BaseTunerLayer):
 
         # Perform SVD decomposition with diagnostics in case of failure
         try:
-            res = slice_pca(weight_tensor, r, device, torch.float32)
+            res = slice_pca(weight_tensor, r, device, torch.float32, random_seed=config.random_seed)
         except Exception as e:
             raise RuntimeError(
                 f"slice_pca raised an exception for layer {adapter_name} (shape={tuple(weight_tensor.shape)}, dtype={weight_tensor.dtype}, device={device}): {e}"
@@ -199,9 +200,6 @@ class AdamssLayer(BaseTunerLayer):
 
         # Store projection matrix in BufferDict (frozen, device-aware)
         self.adamss_newB[adapter_name] = VVT[0, 0, :, :].detach().to(dtype)
-
-        # Use user-specified subspace_rank
-        rank_per_subspace = subspace_rank
 
         # Initialize trainable subspace parameters
         # Collect parameters in lists, then create ParameterList for proper state_dict keys
@@ -489,9 +487,8 @@ class Linear(nn.Module, AdamssLayer):
                             f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
                         )
 
-                    base_layer.weight.data = orig_weight
-
                     # Also update bias if present
+                    orig_bias = None
                     if base_layer.bias is not None:
                         orig_bias = base_layer.bias.data.clone()
                         delta_bias = self.get_delta_bias(active_adapter)
@@ -500,6 +497,10 @@ class Linear(nn.Module, AdamssLayer):
                             raise ValueError(
                                 f"NaNs detected in the merged bias. The adapter {active_adapter} seems to be broken"
                             )
+
+                    # write only after both checks passed, so a failed safe merge leaves the base layer untouched
+                    base_layer.weight.data = orig_weight
+                    if orig_bias is not None:
                         base_layer.bias.data = orig_bias
                 else:
                     delta_weight = self.get_delta_weight(active_adapter)

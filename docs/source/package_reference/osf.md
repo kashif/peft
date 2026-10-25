@@ -44,13 +44,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import OSFConfig, get_peft_model
 
 # Load base model
-model = AutoModelForCausalLM.from_pretrained("gpt2")
+model = AutoModelForCausalLM.from_pretrained("facebook/opt-125m")
 
 # Configure OSF
 config = OSFConfig(
-    target_modules=["c_attn", "c_proj"],  # Target attention layers
+    target_modules=["q_proj", "v_proj"],  # Target attention layers
     effective_rank=8,                     # Default rank for decomposition
-    rank_pattern={"c_attn": 16}          # Override rank for specific modules
+    rank_pattern={"q_proj": 16}           # Override rank for specific modules
 )
 
 # Apply OSF
@@ -59,8 +59,7 @@ model = get_peft_model(model, config)
 # Train as usual
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
-tokenizer.pad_token = tokenizer.eos_token
+tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m")
 
 inputs = tokenizer("Hello world", return_tensors="pt", padding=True)
 loss = model(**inputs, labels=inputs.input_ids).loss
@@ -105,7 +104,7 @@ config = OSFConfig(
         "gate_proj": 4     # Lower rank for gate projection
     }
 )
- 
+
 # Fractional preserved rank is supported (interpreted per-target as fraction * min_dim)
 config = OSFConfig(effective_rank=0.8)  # preserve 80% of min_dim; train remaining 20%
 config = OSFConfig(rank_pattern={"q_proj": 0.5})  # preserve 50% on q_proj, others use global/default
@@ -144,7 +143,7 @@ train_task(model, task_3_data)
 When training on a known sequence of n tasks, one effective strategy is to progressively allocate model capacity to balance learning new tasks while preserving previous knowledge:
 
 - **Task 1**: Use full capacity (train everything)
-- **Task 2**: Freeze 1/n of model capacity, train remaining (n-1)/n capacity  
+- **Task 2**: Freeze 1/n of model capacity, train remaining (n-1)/n capacity
 - **Task 3**: Freeze 2/n of model capacity, train remaining (n-2)/n capacity
 - **Task n**: Freeze (n-1)/n of model capacity, use 1/n capacity for final task
 
@@ -222,6 +221,17 @@ optimizer = torch.optim.AdamW([
 ], lr=1e-4)
 ```
 
+## Benchmark overview
+
+<iframe
+	src="https://peft-internal-testing-peft-method-comparison-embed.hf.space/?highlight[type]=OSF"
+	frameborder="0"
+	width="850"
+	height="1000"
+></iframe>
+
+# API
+
 ## OSFConfig
 
 [[autodoc]] tuners.osf.config.OSFConfig
@@ -235,8 +245,6 @@ optimizer = torch.optim.AdamW([
 ### Weight Decomposition
 
 [[autodoc]] tuners.osf.utils.decompose_weight_matrix
-
-[[autodoc]] tuners.osf.utils.reconstruct_weight_matrix
 
 ### Gradient Projection
 

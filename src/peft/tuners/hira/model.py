@@ -54,19 +54,19 @@ class HiraModel(BaseTuner):
 
     Args:
         model ([`torch.nn.Module`]): The model to be adapted.
-        config ([`LoraConfig`]): The configuration of the Lora model.
+        config ([`HiraConfig`]): The configuration of the HiRA model.
         adapter_name (`str`): The name of the adapter, defaults to `"default"`.
         low_cpu_mem_usage (`bool`, `optional`, defaults to `False`):
             Create empty adapter weights on meta device. Useful to speed up the loading process.
 
     Returns:
-        `torch.nn.Module`: The Lora model.
+        `torch.nn.Module`: The HiRA model.
 
     Example:
 
         ```py
         >>> from transformers import AutoModelForSeq2SeqLM
-        >>> from peft import HiraModel, HiraConfig
+        >>> from peft import HiraConfig, get_peft_model
 
         >>> config = HiraConfig(
         ...     task_type="SEQ_2_SEQ_LM",
@@ -76,13 +76,13 @@ class HiraModel(BaseTuner):
         ... )
 
         >>> model = AutoModelForSeq2SeqLM.from_pretrained("t5-base")
-        >>> hira_model = HiraModel(model, config, "default")
+        >>> hira_model = get_peft_model(model, config)
         ```
 
         ```py
         >>> import torch
         >>> import transformers
-        >>> from peft import HiraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+        >>> from peft import HiraConfig, get_peft_model, prepare_model_for_kbit_training
 
         >>> rank = ...
         >>> target_modules = ["q_proj", "k_proj", "v_proj", "out_proj", "fc_in", "fc_out", "wte"]
@@ -113,7 +113,7 @@ class HiraModel(BaseTuner):
 
     **Attributes**:
         - **model** ([`~transformers.PreTrainedModel`]) -- The model to be adapted.
-        - **peft_config** ([`LoraConfig`]): The configuration of the Lora model.
+        - **peft_config** ([`HiraConfig`]): The configuration of the HiRA model.
     """
 
     prefix: str = "hira_"

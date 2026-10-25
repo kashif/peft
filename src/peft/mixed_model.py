@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import Any, Optional, Union
+from typing import Any, Optional, Self, Union
 
 import torch
 from accelerate.hooks import remove_hook_from_submodules
@@ -168,7 +168,7 @@ class PeftMixedModel(PushToHubMixin, torch.nn.Module):
             f"trainable%: {100 * trainable_params / all_param:.4f}"
         )
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> Any:
         """Forward missing attributes to the wrapped module."""
         try:
             return super().__getattr__(name)  # defer to nn.Module's logic
@@ -234,6 +234,9 @@ class PeftMixedModel(PushToHubMixin, torch.nn.Module):
                 only affect select PEFT tuners. If set to `False`, the dtypes will stay the same as those of the
                 corresponding layer.
         """
+        if adapter_name in self.peft_config:
+            raise ValueError(f"Adapter with name '{adapter_name}' already exists.")
+
         _check_config_compatible(peft_config)
 
         try:
@@ -374,9 +377,17 @@ class PeftMixedModel(PushToHubMixin, torch.nn.Module):
                 Additional arguments to modify the way the adapter is loaded, e.g. the token for Hugging Face Hub.
         """
         # the low_cpu_mem_usage option is handled through kwargs
+        requires_grad = {name: param.requires_grad for name, param in self.named_parameters()}
         output = PeftModel.load_adapter(self, model_id, adapter_name, *args, **kwargs)
+        # Ensure requires_grad state is not overridden by newly loaded parameters
+        for name, param in self.named_parameters():
+            if name not in requires_grad:
+                requires_grad[name] = param.requires_grad
         # TODO: not quite clear why this is necessary but tests fail without it
         self.set_adapter(self.active_adapters)
+        # set_adapter changes requires_grad, so restore each parameter's saved requires_grad state.
+        for name, param in self.named_parameters():
+            param.requires_grad_(requires_grad[name])
         return output
 
     def create_or_update_model_card(self, output_dir: str):
@@ -400,7 +411,7 @@ class PeftMixedModel(PushToHubMixin, torch.nn.Module):
         is_trainable: bool = False,
         config: Optional[PeftConfig] = None,
         **kwargs: Any,
-    ):
+    ) -> Self:
         r"""
         Instantiate a PEFT mixed model from a pretrained model and loaded PEFT weights.
 

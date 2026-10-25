@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import inspect
 import json
 import os
 import pickle
+import sys
 import tempfile
 import warnings
 
@@ -29,7 +31,11 @@ from peft import (
     C3AConfig,
     CartridgeConfig,
     CPTConfig,
+    DeftConfig,
+    DeloraConfig,
     FourierFTConfig,
+    FrodConfig,
+    GloraConfig,
     GraloraConfig,
     HiraConfig,
     HRAConfig,
@@ -52,15 +58,34 @@ from peft import (
     PromptEncoderConfig,
     PromptTuningConfig,
     PsoftConfig,
+    PveraConfig,
+    RandLoraConfig,
     RoadConfig,
+    ShadowConfig,
     ShiraConfig,
+    SupertuningConfig,
     TaskType,
     TinyLoraConfig,
     TrainableTokensConfig,
     VBLoRAConfig,
     VeraConfig,
+    WaveFTConfig,
     XLoraConfig,
 )
+from peft.tuners.lora.config import (
+    ArrowConfig,
+    AstraConfig,
+    BdLoraConfig,
+    CordaConfig,
+    EvaConfig,
+    KasaConfig,
+    LoraGAConfig,
+    VeloraConfig,
+)
+
+
+class TestingCommitHashError(Exception):
+    pass
 
 
 PEFT_MODELS_TO_TEST = [("peft-internal-testing/tiny-opt-lora-revision", "test")]
@@ -73,7 +98,10 @@ ALL_CONFIG_CLASSES = (
     (BeftConfig, {}),
     (BOFTConfig, {}),
     (C3AConfig, {}),
+    (DeftConfig, {}),
     (FourierFTConfig, {}),
+    (FrodConfig, {}),
+    (GloraConfig, {}),
     (GraloraConfig, {}),
     (HiraConfig, {}),
     (HRAConfig, {}),
@@ -94,13 +122,29 @@ ALL_CONFIG_CLASSES = (
     (PsoftConfig, {}),
     (PeanutConfig, {}),
     (RoadConfig, {}),
+    (ShadowConfig, {}),
     (ShiraConfig, {}),
+    (SupertuningConfig, {}),
     (TinyLoraConfig, {}),
     (TrainableTokensConfig, {}),
     (VeraConfig, {}),
     (VBLoRAConfig, {}),
     (XLoraConfig, {"hidden_size": 32, "adapters": {}}),
+    (CPTConfig, {"task_type": "CAUSAL_LM"}),
+    (RandLoraConfig, {}),
+    (DeloraConfig, {}),
+    (OFTConfig, {}),
+    (PveraConfig, {}),
+    (WaveFTConfig, {}),
 )
+
+# Config classes that support selecting layers by index (`layers_to_transform`) together
+# with a custom `layers_pattern`.
+LAYER_INDEXING_CONFIG_CLASSES = [
+    (config_class, mandatory_kwargs)
+    for config_class, mandatory_kwargs in ALL_CONFIG_CLASSES
+    if {"layers_to_transform", "layers_pattern"} <= set(inspect.signature(config_class).parameters)
+]
 
 
 class TestPeftConfig:
@@ -126,6 +170,8 @@ class TestPeftConfig:
         r"""
         Test if all configs work correctly for all valid task types
         """
+        if config_class is CPTConfig:
+            pytest.skip("CPTConfig only supports the CAUSAL_LM task type (validated in its __post_init__)")
         config_class(task_type=valid_task_type, **mandatory_kwargs)
 
     @pytest.mark.parametrize("config_class, mandatory_kwargs", ALL_CONFIG_CLASSES)
@@ -133,6 +179,8 @@ class TestPeftConfig:
         r"""
         Test if all configs correctly raise the defined error message for invalid task types.
         """
+        if config_class is CPTConfig:
+            pytest.skip("CPTConfig validates task_type with a config-specific message in its __post_init__")
         invalid_task_type = "invalid-task-type"
         with pytest.raises(
             ValueError,
@@ -165,6 +213,8 @@ class TestPeftConfig:
         Test if the config is correctly loaded using:
         - from_pretrained
         """
+        if config_class is OFTConfig:
+            pytest.skip("OFT's from_pretrained back-compat guard fires before the generic load path tested here")
         for model_name, revision in PEFT_MODELS_TO_TEST:
             # Test we can load config from delta
             config_class.from_pretrained(model_name, revision=revision)
@@ -195,10 +245,33 @@ class TestPeftConfig:
             # Also test with a runtime_config entry -- they should be ignored, even if they
             # were accidentally saved to disk
             config_from_json["runtime_config"] = {"ephemeral_gpu_offload": True}
-            json.dump(config_from_json, open(config_path, "w"))
+            with open(config_path, "w") as f:
+                json.dump(config_from_json, f)
 
             config_from_json = config_class.from_json_file(config_path)
             assert config.to_dict() == config_from_json
+
+    @pytest.mark.skipif(
+        not sys.platform.startswith("win"), reason="locale-encoding regression only manifests on Windows"
+    )
+    def test_from_json_file_utf8_non_ascii(self, tmp_path):
+        # Config files are UTF-8; without an explicit encoding, reading them on Windows falls back
+        # to the locale encoding (e.g. cp936), crashing or corrupting literal non-ASCII values
+        # (e.g. a hand-edited config or one written by another tool with ensure_ascii=False).
+        value = "汉 模型 🤗 Ё"
+        config_path = os.path.join(tmp_path, "adapter_config.json")
+        # Write the config with literal (non-escaped) non-ASCII characters.
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump({"base_model_name_or_path": value, "peft_type": "LORA"}, f, ensure_ascii=False)
+
+        loaded = LoraConfig.from_json_file(config_path)
+        assert loaded["base_model_name_or_path"] == value
+
+        # Roundtrip through save_pretrained to lock in the write-side encoding pin as well.
+        roundtrip_dir = os.path.join(tmp_path, "roundtrip")
+        LoraConfig(base_model_name_or_path=value).save_pretrained(roundtrip_dir)
+        reloaded = LoraConfig.from_json_file(os.path.join(roundtrip_dir, "adapter_config.json"))
+        assert reloaded["base_model_name_or_path"] == value
 
     @pytest.mark.parametrize("config_class, mandatory_kwargs", ALL_CONFIG_CLASSES)
     def test_to_dict(self, config_class, mandatory_kwargs):
@@ -214,6 +287,8 @@ class TestPeftConfig:
         r"""
         Test if the config is correctly loaded with extra kwargs
         """
+        if config_class is OFTConfig:
+            pytest.skip("OFT's from_pretrained back-compat guard fires before the generic load path tested here")
         with tempfile.TemporaryDirectory() as tmp_dirname:
             for model_name, revision in PEFT_MODELS_TO_TEST:
                 # Test we can load config from delta
@@ -232,6 +307,8 @@ class TestPeftConfig:
         r"""
         Test if the config correctly removes runtime config when saving
         """
+        if config_class is OFTConfig:
+            pytest.skip("OFT's from_pretrained back-compat guard fires before the generic load path tested here")
         with tempfile.TemporaryDirectory() as tmp_dirname:
             for model_name, revision in PEFT_MODELS_TO_TEST:
                 cfg = config_class.from_pretrained(model_name, revision=revision)
@@ -399,7 +476,6 @@ class TestPeftConfig:
             {"total_step": 10, "tinit": 20, "tfinal": 0},
             {"total_step": 10, "tinit": 0, "tfinal": 10},
             {"total_step": 10, "tinit": 10, "tfinal": 0},
-            {"total_step": 10, "tinit": 20, "tfinal": 0},
             {"total_step": 10, "tinit": 20, "tfinal": 20},
             {"total_step": 10, "tinit": 0, "tfinal": 20},
         ],
@@ -476,6 +552,8 @@ class TestPeftConfig:
         """Following up on the previous test about forward compatibility, we *don't* want any random json to be accepted as
         a PEFT config. There should be a minimum set of required keys.
         """
+        if config_class is OFTConfig:
+            pytest.skip("OFT's from_pretrained back-compat guard fires before the generic load path tested here")
         non_peft_json = {"foo": "bar", "baz": 123}
         with open(tmp_path / "adapter_config.json", "w") as f:
             json.dump(non_peft_json, f)
@@ -510,6 +588,19 @@ class TestPeftConfig:
         )
         assert config.layers_to_transform is None
         assert config.layers_pattern is None
+
+    @pytest.mark.parametrize("config_class, mandatory_kwargs", LAYER_INDEXING_CONFIG_CLASSES)
+    def test_config_layers_to_transform_index_zero(self, config_class, mandatory_kwargs):
+        # `layers_to_transform=0` selects the first layer and is a valid index. Because 0
+        # is falsy, a truthiness check on `layers_to_transform` wrongly rejected it when
+        # combined with `layers_pattern`; the guard must compare against None instead.
+        config = config_class(
+            layers_to_transform=0,
+            layers_pattern="model.layers",
+            **mandatory_kwargs,
+        )
+        assert config.layers_to_transform == 0
+        assert config.layers_pattern == "model.layers"
 
     @pytest.mark.parametrize("version", ["0.10", "0.17.0", "1"])
     @pytest.mark.parametrize("config_class, mandatory_kwargs", ALL_CONFIG_CLASSES)
@@ -595,7 +686,7 @@ class TestPeftConfig:
         monkeypatch.setattr(config, "__version__", version)
 
         def fake_commit_hash_raises(pkg_name):
-            raise Exception("Error for testing purpose")
+            raise TestingCommitHashError("Error for testing purpose")
 
         monkeypatch.setattr(config, "_get_commit_hash", fake_commit_hash_raises)
 
@@ -603,3 +694,78 @@ class TestPeftConfig:
         with pytest.warns(UserWarning, match=msg):
             peft_config = config_class(**mandatory_kwargs)
         assert peft_config.peft_version == version + "@UNKNOWN"
+
+    @pytest.mark.parametrize("config_class, mandatory_kwargs", ALL_CONFIG_CLASSES)
+    def test_peft_version_missing_is_recorded(self, config_class, mandatory_kwargs, tmp_path):
+        # Configs from before PEFT 0.18.0 have no peft_version. When loading them, peft_version is set to the current
+        # version, but the private _peft_version_missing attribute records that it was missing. It must not be saved.
+        peft_config = config_class(**mandatory_kwargs)
+        peft_config.save_pretrained(tmp_path)
+        assert config_class.from_pretrained(tmp_path)._peft_version_missing is False
+
+        config_path = tmp_path / "adapter_config.json"
+        config_dict = json.loads(config_path.read_text())
+        del config_dict["peft_version"]
+        config_path.write_text(json.dumps(config_dict))
+
+        for config_loaded in (config_class.from_pretrained(tmp_path), PeftConfig.from_pretrained(tmp_path)):
+            assert config_loaded._peft_version_missing is True
+            assert config_loaded.peft_version == peft_config.peft_version
+
+        config_loaded.save_pretrained(tmp_path / "resaved")
+        config_dict = json.loads((tmp_path / "resaved" / "adapter_config.json").read_text())
+        assert "_peft_version_missing" not in config_dict
+        assert config_dict["peft_version"] == peft_config.peft_version
+
+    def test_save_pretrained_sorts_keys_except_pattern_keys(self, tmp_path):
+        # The config is written with sorted keys, nested dicts included, but the order of rank_pattern and
+        # alpha_pattern is kept, see #3818. Testing LoRA is enough: all configs are saved by the same
+        # PeftConfigMixin.save_pretrained, and the methods that support these arguments use the same names.
+        config = LoraConfig(
+            rank_pattern={"module.foo": 16, "foo": 4},
+            alpha_pattern={"module.foo": 2, "foo": 8},
+            init_lora_weights="loftq",
+            loftq_config={"loftq_iter": 2, "loftq_bits": 4},
+        )
+        config.save_pretrained(tmp_path)
+        config_dict = json.loads((tmp_path / "adapter_config.json").read_text())
+
+        assert list(config_dict["rank_pattern"]) == ["module.foo", "foo"]
+        assert list(config_dict["alpha_pattern"]) == ["module.foo", "foo"]
+        assert list(config_dict["loftq_config"]) == ["loftq_bits", "loftq_iter"]
+
+        # apart from the order of the pattern keys, the file is the same as when sorting all keys
+        for key in ("rank_pattern", "alpha_pattern"):
+            config_dict[key] = dict(sorted(config_dict[key].items()))
+        assert json.dumps(config_dict, indent=2) == json.dumps(config_dict, indent=2, sort_keys=True)
+
+
+class TestLoraNestedConfigRoundTrip:
+    # Regression tests for https://github.com/huggingface/peft/issues/3583:
+    # nested LoRA sub-configs used to come back as plain dicts after
+    # save_pretrained → from_pretrained, crashing consumers with AttributeError.
+    @pytest.mark.parametrize(
+        "attribute_name, nested_config_cls, dummy_field, dummy_value",
+        [
+            ("eva_config", EvaConfig, "rho", 7.5),
+            ("corda_config", CordaConfig, "corda_method", "kpm"),
+            ("astra_config", AstraConfig, "verbose", True),
+            ("arrow_config", ArrowConfig, "top_k", 4),
+            ("lora_ga_config", LoraGAConfig, "direction", "ArBr"),
+            ("use_bdlora", BdLoraConfig, "nblocks", 4),
+            ("velora_config", VeloraConfig, "num_groups", 32),
+            ("kasa_config", KasaConfig, "beta", 2e-4),
+        ],
+    )
+    def test_nested_config_survives_save_load_roundtrip(
+        self, tmp_path, attribute_name, nested_config_cls, dummy_field, dummy_value
+    ):
+        config = LoraConfig(r=4, lora_alpha=8, target_modules=["lin0"], lora_dropout=0.0)
+        setattr(config, attribute_name, nested_config_cls(**{dummy_field: dummy_value}))
+
+        config.save_pretrained(tmp_path)
+        loaded = LoraConfig.from_pretrained(tmp_path)
+
+        nested = getattr(loaded, attribute_name)
+        assert isinstance(nested, nested_config_cls)
+        assert getattr(nested, dummy_field) == dummy_value

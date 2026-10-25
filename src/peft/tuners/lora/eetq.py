@@ -25,6 +25,14 @@ from .config import LoraConfig
 if is_eetq_available():
     from eetq import EetqLinear
 
+    try:
+        from transformers.integrations.eetq import EetqLinear as TransformersEetqLinear
+
+        # in newer transformers versions, EETQ quantization uses a transformers-specific class
+        eetq_classes = (EetqLinear, TransformersEetqLinear)
+    except ImportError:
+        eetq_classes = (EetqLinear,)
+
     class EetqLoraLinear(torch.nn.Module, LoraLayer):
         def __init__(
             self,
@@ -42,6 +50,7 @@ if is_eetq_available():
 
             super().__init__()
             LoraLayer.__init__(self, base_layer)
+            self.fan_in_fan_out = False
 
             # self.base_layer and self.quant_linear_module are the same; we need the former for consistency and the latter
             # for backwards compatibility
@@ -105,7 +114,7 @@ def dispatch_eetq(
     else:
         target_base_layer = target
 
-    if is_eetq_available() and isinstance(target_base_layer, EetqLinear):
+    if is_eetq_available() and isinstance(target_base_layer, eetq_classes):
         new_module = EetqLoraLinear(target, adapter_name, config=config, **kwargs)
         target.weight = target_base_layer.weight
 

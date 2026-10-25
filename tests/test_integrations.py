@@ -304,7 +304,6 @@ class TestTransformersV5:
         # Ensure that using LoRA directly with a v5 model still works
         inputs = torch.arange(10).view(1, -1).to(device=self.torch_device)
         model_id = "hf-internal-testing/Mixtral-tiny"
-        lora_id = "peft-internal-testing/mixtral-pre-v5-lora"
 
         with hub_online_once(model_id):
             model = AutoModelForCausalLM.from_pretrained(model_id).to(self.torch_device)
@@ -365,22 +364,22 @@ class TestTransformersV5:
             config = LoraConfig(target_modules=["q_proj", "v_proj"])
             get_peft_model(model, config)  # does not raise
 
-    def test_qwen3_moe_error_message(self):
+    @pytest.mark.parametrize(
+        "target_modules", [["up_proj", "down_proj", "score"], r".*\.(up_proj|down_proj)"], ids=["list", "regex"]
+    )
+    def test_qwen3_moe_partial_fusion_raises(self, target_modules):
         # https://github.com/huggingface/trl/issues/5428
-        # When only targeting the up_proj, we should get an error because up and gate projection are fused. There was an
-        # error during handling of the error message. This test ensure that the error is handled correctly. See the net
-        # test for a correct PEFT config.
+        # Targeting up_proj but not gate_proj must raise -- they are fused into gate_up_proj. Covers the list and regex
+        # paths and guards the error-message handling. See `test_qwen3_moe_works` for a valid config.
         model_id = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
         with hub_online_once(model_id):
             model = AutoModelForCausalLM.from_pretrained(model_id)
-            # only target up_proj but not gate_proj
-            config = LoraConfig(target_modules=["up_proj", "down_proj", "score"])
             msg = re.escape(
                 "Cannot convert PEFT target(s) up_proj without also targeting gate_proj because they are fused into "
                 "gate_up_proj."
             )
             with pytest.raises(ValueError, match=msg):
-                get_peft_model(model, config)
+                get_peft_model(model, LoraConfig(target_modules=target_modules))
 
     def test_qwen3_moe_works(self):
         # https://github.com/huggingface/trl/issues/5428
@@ -391,3 +390,230 @@ class TestTransformersV5:
             # target up_proj and gate_proj
             config = LoraConfig(target_modules=["gate_proj", "up_proj", "down_proj", "score"])
             get_peft_model(model, config)  # does not raise
+
+    @pytest.mark.parametrize(
+        "regex",
+        [
+            # the shape ms-swift's get_multimodal_target_regex emits: anchored, prefix lookahead
+            r"^(model(?=\.).*\.(q_proj|k_proj|v_proj|gate_proj|up_proj|down_proj))$",
+            # a plain "ends with one of these projections" pattern
+            r".*\.(q_proj|k_proj|v_proj|gate_proj|up_proj|down_proj)",
+        ],
+    )
+    def test_qwen3_moe_regex_target_modules_works(self, regex):
+        # Regression test for https://github.com/huggingface/peft/issues/3229: the conversion used to `set()` the regex
+        # string, splitting it into characters. It is now resolved to concrete names against the model.
+        model_id = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
+        with hub_online_once(model_id):
+            model = AutoModelForCausalLM.from_pretrained(model_id)
+            peft_model = get_peft_model(model, LoraConfig(target_modules=regex))  # does not raise
+
+        config = peft_model.peft_config["default"]
+        # non-fused targets stay in target_modules; fused experts move to target_parameters (rank/alpha doubled for the
+        # 2-way gate_up_proj). The regex does not name the router, so `gate.weight` is *not* pulled in (contrast
+        # `test_qwen3_moe_all_linear_target_modules_works`, where "all-linear" does pull it in).
+        assert config.target_modules == {"q_proj", "k_proj", "v_proj"}
+        assert set(config.target_parameters) == {"gate_up_proj", "down_proj"}
+        assert config.rank_pattern == {r".*\.gate_up_proj": config.r * 2}
+        assert config.alpha_pattern == {r".*\.gate_up_proj": config.lora_alpha * 2}
+        # the experts are actually adapted, not just recorded in the config
+        assert any("experts" in name for name, _ in peft_model.named_modules() if name.endswith("lora_A.default"))
+
+    def test_qwen3_moe_single_attention_regex_target_modules_works(self):
+        # A regex resolving to a single attention projection (no experts) converts cleanly: nothing moves to parameters.
+        model_id = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
+        with hub_online_once(model_id):
+            model = AutoModelForCausalLM.from_pretrained(model_id)
+            peft_model = get_peft_model(model, LoraConfig(target_modules=r".*\.q_proj"))  # does not raise
+
+        config = peft_model.peft_config["default"]
+        assert config.target_modules == {"q_proj"}
+        assert not config.target_parameters
+        assert not config.rank_pattern
+        adapted = {
+            name.rsplit(".lora_A", 1)[0].rsplit(".", 1)[-1]
+            for name, _ in peft_model.named_modules()
+            if name.endswith("lora_A.default")
+        }
+        assert adapted == {"q_proj"}
+
+    def test_qwen3_moe_all_linear_target_modules_works(self):
+        # "all-linear" is matched by module type, not as a regex. On v4 the experts *and* the router `gate` were
+        # nn.Linear, so "all-linear" targeted them; after fusion the experts are stacked parameters and the router is a
+        # custom module, so "all-linear" must still carry all of them into target_parameters (gate -> gate.weight).
+        model_id = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
+        with hub_online_once(model_id):
+            model = AutoModelForCausalLM.from_pretrained(model_id)
+            peft_model = get_peft_model(model, LoraConfig(target_modules="all-linear"))  # does not raise
+
+        config = peft_model.peft_config["default"]
+        adapted = {
+            name.rsplit(".lora_A", 1)[0].rsplit(".", 1)[-1]
+            for name, _ in peft_model.named_modules()
+            if name.endswith("lora_A.default")
+        }
+        # attention projections resolved as modules; experts and router (linear in v4) carried into target_parameters
+        assert {"q_proj", "k_proj", "v_proj", "o_proj"} <= adapted
+        # the router `gate` is adapted too -- it is a parameter (`gate.weight`) on v5, so unlike the regex case it has
+        # to be added by name; this is exactly what distinguishes "all-linear" from a regex that omits the router
+        assert set(config.target_parameters) == {"gate.weight", "gate_up_proj", "down_proj"}
+        assert config.rank_pattern == {r".*\.gate_up_proj": config.r * 2}
+        assert config.alpha_pattern == {r".*\.gate_up_proj": config.lora_alpha * 2}
+        # the experts and the router gate are actually adapted, not just recorded in the config
+        assert any("experts" in name for name, _ in peft_model.named_modules() if name.endswith("lora_A.default"))
+        assert any(name.endswith(".mlp.gate.lora_A.default") for name, _ in peft_model.named_modules())
+
+    def test_qwen3_moe_regex_target_modules_save_load_roundtrip(self, tmp_path):
+        # Save/reload a regex-targeted adapter. Reload re-runs the conversion on the already-converted config, so this
+        # also guards idempotency.
+        inputs = torch.arange(10).view(1, -1).to(self.torch_device)
+        model_id = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
+        regex = r"^(model(?=\.).*\.(q_proj|k_proj|v_proj|gate_proj|up_proj|down_proj))$"
+
+        with hub_online_once(model_id):
+            model = AutoModelForCausalLM.from_pretrained(model_id).to(self.torch_device)
+            # init_lora_weights=False gives the adapter non-zero (random) weights so it actually changes the output
+            peft_model = get_peft_model(model, LoraConfig(target_modules=regex, init_lora_weights=False))
+            with torch.inference_mode():
+                logits_before = peft_model(inputs).logits
+            peft_model.save_pretrained(tmp_path)
+            del model, peft_model
+
+            model = AutoModelForCausalLM.from_pretrained(model_id).to(self.torch_device)
+            reloaded = PeftModel.from_pretrained(model, tmp_path)
+            with torch.inference_mode():
+                logits_after = reloaded(inputs).logits
+
+        assert torch.allclose(logits_before, logits_after, atol=1e-5, rtol=1e-5)
+        # reload re-runs the conversion on the already-resolved config -- idempotent
+        reloaded_config = reloaded.peft_config["default"]
+        assert reloaded_config.target_modules == {"q_proj", "k_proj", "v_proj"}
+        assert {"gate_up_proj", "down_proj"} <= set(reloaded_config.target_parameters)
+        assert reloaded_config.rank_pattern == {r".*\.gate_up_proj": reloaded_config.r * 2}
+
+    # Tiny configs with 2 layers: layer 0 has a dense MLP, layer 1 is MoE (plus shared experts where the architecture has
+    # them). The dense and shared-expert projections are plain nn.Linear on v5 but share their names with the fused
+    # experts (gate_proj, up_proj, down_proj). See #3801.
+    _moe_base_kwargs = {
+        "vocab_size": 128,
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "moe_intermediate_size": 16,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+    }
+    _dsv3_kwargs = {
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 2,
+        "first_k_dense_replace": 1,
+        "n_group": 1,
+        "topk_group": 1,
+    }
+    _moe_dense_shared_kwargs = {
+        "qwen3_moe": {"num_experts": 4, "num_experts_per_tok": 2, "mlp_only_layers": [0]},
+        "qwen3_next": {
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "mlp_only_layers": [0],
+            "shared_expert_intermediate_size": 16,
+            "layer_types": ["full_attention"] * 2,
+        },
+        "glm4_moe": _dsv3_kwargs,
+        "deepseek_v3": {
+            **_dsv3_kwargs,
+            "q_lora_rank": 16,
+            "kv_lora_rank": 16,
+            "qk_rope_head_dim": 8,
+            "qk_nope_head_dim": 8,
+            "v_head_dim": 8,
+        },
+        "cohere2_moe": {
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "num_shared_experts": 1,
+            "mlp_layer_types": ["dense", "sparse"],
+            "prefix_dense_intermediate_size": 64,
+            "layer_types": ["sliding_attention", "full_attention"],
+        },
+        "afmoe": {
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "num_shared_experts": 1,
+            "num_dense_layers": 1,
+            "layer_types": ["full_attention"] * 2,
+        },
+    }
+
+    def _get_tiny_moe_model(self, model_type):
+        if model_type not in transformers.CONFIG_MAPPING:
+            pytest.skip(f"{model_type} is not available in this transformers version")
+        config = transformers.AutoConfig.for_model(
+            model_type, **self._moe_base_kwargs, **self._moe_dense_shared_kwargs[model_type]
+        )
+        torch.manual_seed(0)
+        return AutoModelForCausalLM.from_config(config).eval()
+
+    @pytest.mark.parametrize("model_type", list(_moe_dense_shared_kwargs))
+    def test_all_linear_targets_dense_and_shared_expert_layers(self, model_type):
+        # https://github.com/huggingface/peft/issues/3801
+        # "all-linear" used to reduce the resolved nn.Linear names to their leaf names, so the dense MLP and shared-expert
+        # projections were remapped to the fused expert parameters and not targeted at all.
+        model = self._get_tiny_moe_model(model_type)
+        mlp_linears = {
+            name
+            for name, module in model.named_modules()
+            if isinstance(module, nn.Linear) and ".mlp." in name and not name.endswith(".router.gate")
+        }
+        assert mlp_linears  # sanity check: the tiny config has dense/shared-expert layers
+
+        peft_model = get_peft_model(model, LoraConfig(r=2, target_modules="all-linear"))
+
+        targeted_modules = {name.removeprefix("base_model.model.") for name in peft_model.targeted_module_names}
+        assert mlp_linears <= targeted_modules
+        # the fused experts are still targeted as parameters
+        targeted_parameters = set(peft_model.targeted_parameter_names)
+        assert "model.layers.1.mlp.experts.gate_up_proj" in targeted_parameters
+        assert "model.layers.1.mlp.experts.down_proj" in targeted_parameters
+        if model_type != "afmoe":
+            # afmoe's router is itself an nn.Linear (see test_all_linear_afmoe_linear_router_targeted_once below),
+            # every other architecture here has a non-Linear router module, so its weight is targeted as a
+            # parameter instead.
+            assert any(name.endswith(".gate.weight") for name in targeted_parameters)
+
+    def test_all_linear_afmoe_linear_router_targeted_once(self):
+        # https://github.com/huggingface/peft/issues/3801
+        # afmoe's router `mlp.router.gate` is an nn.Linear on v5, unlike the other architectures covered above. It
+        # must be targeted once, as the plain module it is, not also as a parameter through its own weight, which
+        # would raise.
+        model = self._get_tiny_moe_model("afmoe")
+        peft_model = get_peft_model(model, LoraConfig(r=2, target_modules="all-linear"))  # does not raise
+
+        assert "model.layers.1.mlp.router.gate" in peft_model.targeted_module_names
+        assert not any(name.endswith(".router.gate.weight") for name in peft_model.targeted_parameter_names)
+
+    def test_all_linear_dense_and_shared_expert_layers_save_load_roundtrip(self, tmp_path):
+        # The dense and shared-expert projections are stored as qualified names in the converted config. Reloading
+        # re-runs the conversion on that config, which should target the same layers and give the same output.
+        inputs = torch.arange(10).view(1, -1)
+        model = self._get_tiny_moe_model("glm4_moe")
+        # init_lora_weights=False gives the adapter non-zero (random) weights so it actually changes the output
+        peft_model = get_peft_model(model, LoraConfig(r=2, target_modules="all-linear", init_lora_weights=False))
+        with torch.inference_mode():
+            logits_before = peft_model(inputs).logits
+        peft_model.save_pretrained(tmp_path)
+
+        reloaded = PeftModel.from_pretrained(self._get_tiny_moe_model("glm4_moe"), tmp_path)
+        with torch.inference_mode():
+            logits_after = reloaded(inputs).logits
+
+        assert torch.allclose(logits_before, logits_after, atol=1e-5, rtol=1e-5)
+        assert set(reloaded.targeted_module_names) == set(peft_model.targeted_module_names)
+        assert set(reloaded.targeted_parameter_names) == set(peft_model.targeted_parameter_names)
+        # layer 0 is dense, layer 1 has a shared expert; both kept as module targets through the reload
+        targeted_modules = {name.removeprefix("base_model.model.") for name in reloaded.targeted_module_names}
+        for layer_prefix in ["model.layers.0.mlp", "model.layers.1.mlp.shared_experts"]:
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                assert f"{layer_prefix}.{proj}" in targeted_modules
