@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
@@ -36,10 +35,10 @@ class RandLoraConfig(PeftConfig):
         projection_prng_key (`int`):
             RandLora PRNG init key. Used for initialising basis_A and basis_B for new models or when loading a
             checkpoint that did not include these projections. Defaults to `0`.
-        save_projection (`bool`):
+        save_projection (`bool`, *optional*, defaults to `False`):
             Whether to save the global basis_A / basis_B random basis in the state dict alongside per layer lambda /
-            gamma diagonal matrices. This will increase the size of the checkpoint, but guarantee that we can reload
-            the checkpoint on all system configurations. Defaults to `True`.
+            gamma diagonal matrices. If `False`, the projections are regenerated from `projection_prng_key` when loading.
+            Set to `True` to guarantee restoring the projections across system configurations and PyTorch versions.
         sparse (`bool`):
             Whether to use sparse random bases as described in the RandLora paper. The bases are ternary sparse bases
             (only containing -1, 0 and 1) where the attribution probability is 1/6 for -1 and 1 and 2/3 for 0. These
@@ -107,10 +106,8 @@ class RandLoraConfig(PeftConfig):
         metadata={
             "help": (
                 "Whether to save the basis_A / basis_B projections in the state dict alongside per layer lambda / "
-                "gamma weights. When False (default), projections are regenerated deterministically from "
-                "`projection_prng_key` on load, keeping checkpoints small (only lambda/gamma are saved). "
-                "Set to True only if you need to load the checkpoint on a system where the projection cannot "
-                "be reproduced (e.g. different PyTorch version with changed RNG behaviour)."
+                "gamma weights. If False (default), projections are regenerated from `projection_prng_key` on load. "
+                "Set to True to guarantee restoring the projections across system configurations and PyTorch versions."
             )
         },
     )
@@ -193,10 +190,3 @@ class RandLoraConfig(PeftConfig):
         self.target_modules = (
             set(self.target_modules) if isinstance(self.target_modules, list) else self.target_modules
         )
-
-        if not self.save_projection:
-            warnings.warn(
-                "Specified to not save basis_A and basis_B within the state dictionary, instead they will be restored "
-                "using the PRNG key store in `config.projection_prng_key`. Consider setting `config.save_projection` "
-                "to `True` to guarantee restoring the checkpoint correctly on all system configurations."
-            )

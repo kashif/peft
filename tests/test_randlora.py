@@ -211,14 +211,22 @@ class TestRandLora:
         # Direct serialization should succeed once the shared projections have no aliased entries in the state dict.
         save_file(state_dict, tmp_path / "adapter.safetensors")
 
-    def test_save_projection_true_roundtrip(self, mlp, tmp_path):
+    @pytest.mark.parametrize("config_kwargs", [{}, {"save_projection": False}, {"save_projection": True}])
+    def test_save_projection_roundtrip(self, mlp, tmp_path, config_kwargs):
         torch.manual_seed(1)
-        config = RandLoraConfig(target_modules=["lin1", "lin2"], init_weights=False, save_projection=True)
+        config = RandLoraConfig(
+            target_modules=["lin1", "lin2"], init_weights=False, projection_prng_key=123, **config_kwargs
+        )
         peft_model = get_peft_model(mlp, config)
         peft_model.eval()
 
         inputs = torch.randn(5, 10)
         output = peft_model(inputs)
+        state_dict = get_peft_model_state_dict(peft_model)
+        # Omitting save_projection should produce a compact checkpoint, just like explicitly disabling it.
+        save_projection = config_kwargs.get("save_projection", False)
+        for projection_name in ("randlora_A", "randlora_B"):
+            assert sum(projection_name in key for key in state_dict) == int(save_projection)
         peft_model.save_pretrained(tmp_path)
 
         torch.manual_seed(0)
@@ -226,6 +234,7 @@ class TestRandLora:
             warnings.simplefilter("always")
             loaded_model = PeftModel.from_pretrained(MLP(), tmp_path)
         assert not any("Found missing adapter keys" in str(warning.message) for warning in caught_warnings)
+        assert loaded_model.peft_config["default"].save_projection is save_projection
         loaded_model.eval()
         torch.testing.assert_close(loaded_model(inputs), output)
 
